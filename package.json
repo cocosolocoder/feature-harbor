@@ -1,0 +1,10 @@
+{
+  "name": "feature-harbor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.ts serve",
+    "help": "node server.ts --help"
+  }
+}
