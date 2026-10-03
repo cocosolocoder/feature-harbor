@@ -38,7 +38,7 @@ time{color:#666;font-size:.9rem}
 <p id="success" role="status" hidden></p>
 </form>
 <h2>意见列表</h2>
-<p id="empty">还没有意见记录。</p>
+<p id="empty" hidden>还没有意见记录。</p>
 <div id="ideas"></div>
 <p><a href="/api/ideas">查看意见列表接口</a> · <a href="/health">服务状态</a></p>
 </main><script>
@@ -82,18 +82,55 @@ function renderIdea(idea) {
   item.append(time);
   return item;
 }
+let serverIdeas = null;
+let loadFailed = false;
+const submittedIdeas = [];
+const itemNodes = new Map();
+function mergeIdeas() {
+  const seen = new Set();
+  const merged = [];
+  for (const idea of submittedIdeas) {
+    if (idea && !seen.has(idea.id)) { seen.add(idea.id); merged.push(idea); }
+  }
+  if (serverIdeas) {
+    for (const idea of serverIdeas) {
+      if (idea && !seen.has(idea.id)) { seen.add(idea.id); merged.push(idea); }
+    }
+  }
+  return merged;
+}
+function renderList() {
+  const merged = mergeIdeas();
+  const nextIds = new Set(merged.map((idea) => idea.id));
+  for (const id of [...itemNodes.keys()]) {
+    if (!nextIds.has(id)) { itemNodes.get(id).remove(); itemNodes.delete(id); }
+  }
+  let reference = null;
+  for (const idea of merged) {
+    let node = itemNodes.get(idea.id);
+    if (!node) { node = renderIdea(idea); itemNodes.set(idea.id, node); }
+    if (reference) reference.after(node); else list.prepend(node);
+    reference = node;
+  }
+  if (loadFailed) {
+    emptyNote.textContent = '意见列表加载失败，请稍后刷新重试。';
+    emptyNote.hidden = false;
+  } else {
+    emptyNote.textContent = '还没有意见记录。';
+    emptyNote.hidden = serverIdeas ? merged.length > 0 : true;
+  }
+}
 async function loadIdeas() {
   try {
     const res = await fetch('/api/ideas');
     if (!res.ok) throw new Error('load failed');
     const data = await res.json();
-    const ideas = Array.isArray(data.ideas) ? data.ideas : [];
-    emptyNote.hidden = ideas.length > 0;
-    for (const idea of ideas) list.append(renderIdea(idea));
+    serverIdeas = Array.isArray(data.ideas) ? data.ideas : [];
+    loadFailed = false;
   } catch {
-    emptyNote.hidden = false;
-    emptyNote.textContent = '意见列表加载失败，请稍后刷新重试。';
+    loadFailed = true;
   }
+  renderList();
 }
 function validate(title, description, scenario) {
   const trimmed = title.trim();
@@ -133,8 +170,8 @@ form.addEventListener('submit', async (event) => {
   form.reset();
   successBox.textContent = '提交成功，你的意见已保存。';
   successBox.hidden = false;
-  emptyNote.hidden = true;
-  list.prepend(renderIdea(data.idea));
+  if (!submittedIdeas.some((idea) => idea.id === data.idea.id)) submittedIdeas.push(data.idea);
+  renderList();
 });
 loadIdeas();
 </script></html>`;
