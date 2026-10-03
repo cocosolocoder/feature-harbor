@@ -38,7 +38,7 @@ time{color:#666;font-size:.9rem}
 <p id="success" role="status" hidden></p>
 </form>
 <h2>意见列表</h2>
-<p id="empty">还没有意见记录。</p>
+<p id="empty" hidden>还没有意见记录。</p>
 <div id="ideas"></div>
 <p><a href="/api/ideas">查看意见列表接口</a> · <a href="/health">服务状态</a></p>
 </main><script>
@@ -50,6 +50,10 @@ const errorBox = document.getElementById('error');
 const successBox = document.getElementById('success');
 const emptyNote = document.getElementById('empty');
 const list = document.getElementById('ideas');
+const EMPTY_TEXT = '还没有意见记录。';
+const LOAD_FAILED_TEXT = '意见列表加载失败，请稍后刷新重试。';
+// 首次列表请求的状态：loading（进行中）/ ready（成功）/ failed（失败）
+let listState = 'loading';
 function codePoints(text) { return Array.from(text).length; }
 function showError(message) {
   errorBox.textContent = message;
@@ -82,18 +86,42 @@ function renderIdea(idea) {
   item.append(time);
   return item;
 }
+let remoteIdeas = [];
+// 本页已确认保存的意见，最新提交的排在最前
+const submittedIdeas = [];
+function renderList() {
+  // 以服务端标识 id 去重后合并：本页提交成功的意见在前，其后补入首次响应中的其他记录
+  const seen = new Set();
+  const ordered = [];
+  for (const idea of submittedIdeas) {
+    if (!seen.has(idea.id)) { seen.add(idea.id); ordered.push(idea); }
+  }
+  for (const idea of remoteIdeas) {
+    if (!seen.has(idea.id)) { seen.add(idea.id); ordered.push(idea); }
+  }
+  list.replaceChildren(...ordered.map(renderIdea));
+  if (listState === 'failed') {
+    emptyNote.textContent = LOAD_FAILED_TEXT;
+    emptyNote.hidden = false;
+  } else if (listState === 'ready') {
+    emptyNote.textContent = EMPTY_TEXT;
+    emptyNote.hidden = ordered.length > 0;
+  } else {
+    // 首次列表仍在加载，不能把等待误报成没有记录
+    emptyNote.hidden = true;
+  }
+}
 async function loadIdeas() {
   try {
     const res = await fetch('/api/ideas');
     if (!res.ok) throw new Error('load failed');
     const data = await res.json();
-    const ideas = Array.isArray(data.ideas) ? data.ideas : [];
-    emptyNote.hidden = ideas.length > 0;
-    for (const idea of ideas) list.append(renderIdea(idea));
+    remoteIdeas = Array.isArray(data.ideas) ? data.ideas : [];
+    listState = 'ready';
   } catch {
-    emptyNote.hidden = false;
-    emptyNote.textContent = '意见列表加载失败，请稍后刷新重试。';
+    listState = 'failed';
   }
+  renderList();
 }
 function validate(title, description, scenario) {
   const trimmed = title.trim();
@@ -133,8 +161,9 @@ form.addEventListener('submit', async (event) => {
   form.reset();
   successBox.textContent = '提交成功，你的意见已保存。';
   successBox.hidden = false;
-  emptyNote.hidden = true;
-  list.prepend(renderIdea(data.idea));
+  // 只把已确认保存的意见并入列表，随后统一渲染，避免与首次列表响应相互覆盖
+  submittedIdeas.unshift(data.idea);
+  renderList();
 });
 loadIdeas();
 </script></html>`;
