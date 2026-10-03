@@ -5,6 +5,10 @@
   "type": "module",
   "scripts": {
     "start": "node server.ts serve",
-    "help": "node server.ts --help"
+    "help": "node server.ts --help",
+    "test": "node --test --test-timeout=30000 --test-reporter=spec test/*.test.mjs"
+  },
+  "devDependencies": {
+    "puppeteer-core": "^25.12.0"
   }
 }
