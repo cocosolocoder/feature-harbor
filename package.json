@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "start": "node server.ts serve",
-    "help": "node server.ts --help"
+    "help": "node server.ts --help",
+    "test": "node --test"
   }
 }
