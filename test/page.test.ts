@@ -624,6 +624,199 @@ test('提交返回错误状态或非法响应：展示失败信息、保留表�
   }
 });
 
+test('成功状态但响应结构或意见字段异常：一律提示失败、保留表单、列表与已有记录不变', async (t) => {
+  const valid = (): Record<string, unknown> => makeIdea({ id: 'a' });
+  const without = (field: string): Record<string, unknown> => {
+    const record = valid();
+    delete record[field];
+    return record;
+  };
+  const cases = [
+    { name: '顶层为 null', body: null },
+    { name: '顶层为数组', body: [] },
+    { name: '顶层为字符串', body: 'oops' },
+    { name: '顶层为数字', body: 42 },
+    { name: '缺少 idea 字段', body: { saved: true } },
+    { name: 'idea 为空对象', body: { idea: {} } },
+    { name: 'idea 为 null', body: { idea: null } },
+    { name: 'idea 为数组', body: { idea: [] } },
+    { name: 'idea 为字符串', body: { idea: 'a' } },
+    { name: 'idea 为数字', body: { idea: 1 } },
+    { name: 'idea 缺少 id', body: { idea: without('id') } },
+    { name: 'idea 的 id 为空字符串', body: { idea: { ...valid(), id: '' } } },
+    { name: 'idea 的 id 为数字', body: { idea: { ...valid(), id: 1 } } },
+    { name: 'idea 缺少 title', body: { idea: without('title') } },
+    { name: 'idea 的 title 为数字', body: { idea: { ...valid(), title: 1 } } },
+    { name: 'idea 缺少 description', body: { idea: without('description') } },
+    { name: 'idea 的 description 为 null', body: { idea: { ...valid(), description: null } } },
+    { name: 'idea 缺少 scenario', body: { idea: without('scenario') } },
+    { name: 'idea 的 scenario 为数字', body: { idea: { ...valid(), scenario: 0 } } },
+    { name: 'idea 缺少 createdAt', body: { idea: without('createdAt') } },
+    { name: 'idea 的 createdAt 为数字', body: { idea: { ...valid(), createdAt: 0 } } },
+  ];
+  for (const c of cases) {
+    await t.test(c.name, async () => {
+      const h = new Harness(pageScript);
+      const r1 = makeIdea({ id: 'r1', title: '已有意见一' });
+      const r2 = makeIdea({ id: 'r2', title: '已有意见二' });
+      h.gets[0].resolve(jsonResponse(200, { ideas: [r1, r2] }));
+      await flush();
+
+      h.setForm({ title: '被误判的标题', description: '被误判的说明', scenario: '场景' });
+      const failed = h.submit();
+      h.posts[0].resolve(jsonResponse(201, c.body));
+      await failed;
+      await flush();
+
+      assert.equal(h.els.error.hidden, false, c.name);
+      assert.equal(h.els.error.textContent, '提交失败，请稍后重试。', c.name);
+      assert.equal(h.els.success.hidden, true, c.name);
+      // 三个字段原样保留，异常记录不能造成草稿丢失
+      assert.equal(h.els['f-title'].value, '被误判的标题', c.name);
+      assert.equal(h.els['f-desc'].value, '被误判的说明', c.name);
+      assert.equal(h.els['f-scenario'].value, '场景', c.name);
+      // 异常记录不得进入列表，已有意见内容与次序保持原样
+      assert.deepEqual(h.titles(), ['已有意见一', '已有意见二'], c.name);
+    });
+  }
+});
+
+test('成功状态但响应体不是有效 JSON：提示失败、保留表单、不插入列表', async () => {
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: [] }));
+  await flush();
+  assert.equal(h.els.empty.hidden, false);
+
+  h.setForm({ title: '标题', description: '说明' });
+  const failed = h.submit();
+  h.posts[0].resolve(brokenJsonResponse(201));
+  await failed;
+  await flush();
+
+  assert.equal(h.els.error.hidden, false);
+  assert.equal(h.els.error.textContent, '提交失败，请稍后重试。');
+  assert.equal(h.els.success.hidden, true);
+  assert.equal(h.els['f-title'].value, '标题');
+  assert.equal(h.els['f-desc'].value, '说明');
+  assert.equal(h.articles().length, 0);
+  // 空列表提示不被异常提交改变
+  assert.equal(h.els.empty.hidden, false);
+  assert.equal(h.els.empty.textContent, EMPTY_TEXT);
+});
+
+test('提交返回异常期间继续编辑：失败后保留此刻完整草稿（未改动字段、空白、换行），不恢复提交时内容', async () => {
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: [] }));
+  await flush();
+
+  h.setForm({ title: '第一条标题', description: '第一条说明', scenario: '第一条场景' });
+  const failed = h.submit();
+
+  // 等待期间继续写下一条：改标题与场景（含空白换行），详细说明保持不动
+  h.edit('f-title', '第二条\n 标题  ');
+  h.edit('f-scenario', '新场景\n\n含换行');
+
+  h.posts[0].resolve(jsonResponse(201, { idea: {} }));
+  await failed;
+  await flush();
+
+  assert.equal(h.els.error.hidden, false);
+  assert.equal(h.els.error.textContent, '提交失败，请稍后重试。');
+  assert.equal(h.els.success.hidden, true);
+  // 保留的是失败到达此刻的草稿，而不是点击提交时的快照
+  assert.equal(h.els['f-title'].value, '第二条\n 标题  ');
+  assert.equal(h.els['f-desc'].value, '第一条说明');
+  assert.equal(h.els['f-scenario'].value, '新场景\n\n含换行');
+  assert.equal(h.articles().length, 0);
+});
+
+test('首次列表加载失败后提交返回异常：加载失败提示与提交失败提示同时保留，互不清除', async () => {
+  const h = new Harness(pageScript);
+  h.gets[0].reject(new TypeError('Failed to fetch'));
+  await flush();
+
+  h.setForm({ title: '标题', description: '说明' });
+  const failed = h.submit();
+  h.posts[0].resolve(jsonResponse(201, { idea: [] }));
+  await failed;
+  await flush();
+
+  assert.equal(h.els.empty.hidden, false);
+  assert.equal(h.els.empty.textContent, LOAD_FAILED_TEXT);
+  assert.equal(h.els.error.hidden, false);
+  assert.equal(h.els.error.textContent, '提交失败，请稍后重试。');
+  assert.equal(h.els.success.hidden, true);
+  assert.equal(h.els['f-title'].value, '标题');
+  assert.equal(h.els['f-desc'].value, '说明');
+  assert.equal(h.articles().length, 0);
+});
+
+test('异常响应处理后再次提交合法意见：正常显示成功、清空表单并插入列表，不受前次异常影响', async () => {
+  const h = new Harness(pageScript);
+  const r1 = makeIdea({ id: 'r1', title: '已有意见' });
+  h.gets[0].resolve(jsonResponse(200, { ideas: [r1] }));
+  await flush();
+
+  h.setForm({ title: '重试标题', description: '重试说明' });
+  const firstAttempt = h.submit();
+  h.posts[0].resolve(jsonResponse(201, { idea: {} }));
+  await firstAttempt;
+  assert.equal(h.els.error.hidden, false);
+  assert.equal(h.articles().length, 1);
+
+  // 草稿仍在，可以直接再次提交
+  const mine = makeIdea({ id: 'a', title: '重试标题', description: '重试说明' });
+  const secondAttempt = h.submit();
+  h.posts[1].resolve(jsonResponse(201, { idea: mine }));
+  await secondAttempt;
+  await flush();
+
+  assert.equal(h.els.success.hidden, false);
+  assert.equal(h.els.success.textContent, SUCCESS_TEXT);
+  assert.equal(h.els.error.hidden, true);
+  assert.equal(h.els['f-title'].value, '');
+  assert.equal(h.els['f-desc'].value, '');
+  assert.equal(h.els['f-scenario'].value, '');
+  assert.deepEqual(h.titles(), ['重试标题', '已有意见']);
+});
+
+test('成功响应中 scenario 为空字符串仍属合法：正常保存成功，不因没有使用场景拒绝', async () => {
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: [] }));
+  await flush();
+
+  const mine = makeIdea({ id: 'a', title: '空场景意见', description: '说明', scenario: '' });
+  h.setForm({ title: '空场景意见', description: '说明' });
+  const done = h.submit();
+  h.posts[0].resolve(jsonResponse(201, { idea: mine }));
+  await done;
+  await flush();
+
+  assert.equal(h.els.success.hidden, false);
+  assert.equal(h.els.success.textContent, SUCCESS_TEXT);
+  assert.equal(h.els.error.hidden, true);
+  assert.equal(h.els['f-title'].value, '');
+  const articles = h.articles();
+  assert.equal(articles.length, 1);
+  assertArticleMatches(articles[0], mine);
+});
+
+test('成功响应含其他附加字段不影响判断：意见照常保存并展示', async () => {
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: [] }));
+  await flush();
+
+  const mine = { ...makeIdea({ id: 'a', title: '附加字段意见' }), extra: 'whatever', nested: { x: 1 } };
+  h.setForm({ title: '附加字段意见', description: '说明' });
+  const done = h.submit();
+  h.posts[0].resolve(jsonResponse(201, { idea: mine, ok: true }));
+  await done;
+  await flush();
+
+  assert.equal(h.els.success.hidden, false);
+  assert.deepEqual(h.titles(), ['附加字段意见']);
+});
+
 test('提交失败后再次提交成功：失败提示清除、表单清空、新意见与已有意见同时展示', async () => {
   const h = new Harness(pageScript);
   const r1 = makeIdea({ id: 'r1', title: '已有意见' });

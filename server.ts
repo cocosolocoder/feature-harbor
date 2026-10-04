@@ -176,10 +176,17 @@ form.addEventListener('submit', async (event) => {
     showError('网络错误，提交未成功，请重试。');
     return;
   }
+  // 成功状态下只有“带合法 idea 对象的 JSON 对象”才算保存成功：
+  // 响应不是有效 JSON、顶层不是对象、idea 缺失/为空/为数组或字段不合要求，
+  // 一律按提交失败处理，不清空表单、不插入列表，也不用表单内容补齐缺失字段
   let data = null;
   try { data = await res.json(); } catch { data = null; }
-  if (!res.ok || !data || !data.idea) {
+  if (!res.ok) {
     showError(data && data.error ? '提交失败：' + data.error : '提交失败，请稍后重试。');
+    return;
+  }
+  if (typeof data !== 'object' || data === null || Array.isArray(data) || !isValidIdea(data.idea)) {
+    showError('提交失败，请稍后重试。');
     return;
   }
   // 只有等待期间没有继续编辑（包括改回原文、清空字段也算编辑）才清空表单；
