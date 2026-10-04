@@ -843,3 +843,284 @@ test('两条提交在途且期间未编辑：先返回的成功清空表单，�
   assert.equal(articles.length, 2);
   assert.deepEqual(h.titles(), ['同文意见', '同文意见']);
 });
+
+// 字符上限的首页表单回归。与 test/length-limits.test.ts 的接口用例使用同一批边界内容，
+// 保证「首页表单」与「直接提交接口」两个入口对中文、表情、换行与首尾空白的接受/拒绝一致。
+// 长度按 Unicode 码点计（标题 120、详细说明 5000、使用场景 1000）；
+// 这些用例要能发现：表情被算成两个字符（UTF-16 码元）、按传输字节计数、
+// 恰好达到上限被错误拒绝，以及前端对超限内容放行了请求。
+const TITLE_LIMIT_ERROR = '标题最多 120 个字符。';
+const DESC_LIMIT_ERROR = '详细说明最多 5000 个字符。';
+const SCENARIO_LIMIT_ERROR = '使用场景最多 1000 个字符。';
+const codePointCount = (text: string): number => Array.from(text).length;
+const repeatCp = (char: string, times: number): string => char.repeat(times);
+
+test('边界内容：三个字段同时达到各自上限（含中文、表情、换行与首尾空白），确认保存后显示成功、展示实际保存的意见、未继续编辑时三框清空', async () => {
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: [] }));
+  await flush();
+
+  // 标题：去首尾空白后恰好 120 码点（59 中文 + 两个内部空格 + 59 中文），内部空白计入
+  const typedTitle = '  ' + repeatCp('中', 59) + '  ' + repeatCp('中', 59) + '\t';
+  const savedTitle = typedTitle.trim();
+  assert.equal(codePointCount(savedTitle), 120);
+  // 详细说明：首尾空白与换行计入长度，恰好 5000 码点
+  const description = '  ' + repeatCp('中', 4995) + '\n  ';
+  assert.equal(codePointCount(description), 5000);
+  // 使用场景：中文与单个 😀 各算一个码点，恰好 1000 码点
+  const scenario = repeatCp('中', 700) + repeatCp('😀', 200) + repeatCp('A', 98) + '\n\n';
+  assert.equal(codePointCount(scenario), 1000);
+
+  h.setForm({ title: typedTitle, description, scenario });
+  const submitted = h.submit();
+  // 合法边界必须放行请求；请求体是点击提交时的原文（标题的首尾空白由服务端处理）
+  assert.equal(h.postsIssued, 1);
+  assert.deepEqual(JSON.parse(h.postBodies[0] as string), {
+    title: typedTitle,
+    description,
+    scenario,
+  });
+
+  // 服务确认保存后的记录：标题已去首尾空白、正文与场景原样保留
+  const mine = makeIdea({ id: 'a', title: savedTitle, description, scenario });
+  h.posts[0].resolve(jsonResponse(201, { idea: mine }));
+  await submitted;
+  await flush();
+
+  assert.equal(h.els.success.hidden, false);
+  assert.equal(h.els.success.textContent, SUCCESS_TEXT);
+  assert.equal(h.els.error.hidden, true);
+  // 等待期间没有继续编辑，三个输入框按现有行为清空
+  assert.equal(h.els['f-title'].value, '');
+  assert.equal(h.els['f-desc'].value, '');
+  assert.equal(h.els['f-scenario'].value, '');
+  // 列表展示的是实际保存的意见（标题为去空白后的结果，正文/场景含空白换行）
+  const articles = h.articles();
+  assert.equal(articles.length, 1);
+  assertArticleMatches(articles[0], mine);
+});
+
+test('码点计数：表情与多码点文字凑出的恰好上限应通过表单校验（按 UTF-16 码元或字节计都会误判）', async (t) => {
+  // 用转义写死组成：旗帜 2 码点、😮‍💨 3 码点、é(e+U+0301 组合重音) 2 码点
+  const flag = '🇨🇳';
+  const zwjEmoji = '😮‍💨';
+  const combining = String.fromCodePoint(0x65, 0x301); // e + 组合重音 = 2 码点
+  assert.deepEqual([flag, zwjEmoji, combining].map(codePointCount), [2, 3, 2]);
+
+  const cases = [
+    {
+      name: '标题 119 中文 + 单个 😀 = 120 码点（😀 占 2 个 UTF-16 码元、4 个字节）',
+      values: { title: repeatCp('中', 119) + '😀', description: '说明' },
+    },
+    {
+      name: '详细说明为 5000 个 😀（码元 10000、字节 20000）',
+      values: { title: '表情正文标题', description: repeatCp('😀', 5000) },
+    },
+    {
+      name: '标题含旗帜、ZWJ 表情、组合字符，按各自码点累计恰好 120',
+      values: { title: flag + zwjEmoji + combining + repeatCp('中', 113), description: '说明' },
+    },
+    {
+      name: '使用场景 997 中文 + 旗帜(2) + 😀(1) = 1000 码点',
+      values: { title: '场景标题', description: '说明', scenario: repeatCp('中', 997) + flag + '😀' },
+    },
+  ];
+  for (const c of cases) {
+    await t.test(c.name, async () => {
+      const h = new Harness(pageScript);
+      h.setForm(c.values);
+      const submitted = h.submit();
+      assert.equal(h.postsIssued, 1, c.name);
+      assert.equal(h.els.error.hidden, true, c.name);
+
+      // 回包里的记录按原文展示，不被截断
+      const saved = makeIdea({
+        id: 'a',
+        title: c.values.title.trim(),
+        description: c.values.description,
+        scenario: c.values.scenario ?? '',
+      });
+      h.posts[0].resolve(jsonResponse(201, { idea: saved }));
+      await submitted;
+      await flush();
+      assert.equal(h.els.success.hidden, false, c.name);
+      assert.equal(h.articles().length, 1, c.name);
+      assertArticleMatches(h.articles()[0], saved);
+    });
+  }
+});
+
+test('任一超限字段：发出请求前显示对应字段错误，保留全部输入，不增加列表记录，也不出现保存成功提示', async (t) => {
+  const cases = [
+    {
+      name: '标题 121 码点（中文）',
+      values: { title: repeatCp('中', 121), description: '有效说明', scenario: '场景' },
+      message: TITLE_LIMIT_ERROR,
+    },
+    {
+      name: '标题去首尾空白后 121 码点（首尾空白不占额度）',
+      values: { title: '  ' + repeatCp('中', 121) + ' ', description: '有效说明', scenario: '场景' },
+      message: TITLE_LIMIT_ERROR,
+    },
+    {
+      name: '标题 120 中文 + 单个 😀 = 121 码点',
+      values: { title: repeatCp('中', 120) + '😀', description: '有效说明', scenario: '场景' },
+      message: TITLE_LIMIT_ERROR,
+    },
+    {
+      name: '详细说明 5001 码点（中文）',
+      values: { title: '有效标题', description: repeatCp('中', 5001), scenario: '场景' },
+      message: DESC_LIMIT_ERROR,
+    },
+    {
+      name: '详细说明 5000 中文 + 单个 😀 = 5001 码点',
+      values: { title: '有效标题', description: repeatCp('中', 5000) + '😀', scenario: '场景' },
+      message: DESC_LIMIT_ERROR,
+    },
+    {
+      name: '使用场景 1001 码点（中文）',
+      values: { title: '有效标题', description: '有效说明', scenario: repeatCp('中', 1001) },
+      message: SCENARIO_LIMIT_ERROR,
+    },
+    {
+      name: '使用场景 1000 中文 + 单个 😀 = 1001 码点',
+      values: { title: '有效标题', description: '有效说明', scenario: repeatCp('中', 1000) + '😀' },
+      message: SCENARIO_LIMIT_ERROR,
+    },
+  ];
+  for (const c of cases) {
+    await t.test(c.name, async () => {
+      const h = new Harness(pageScript);
+      const existing = makeIdea({ id: 'r1', title: '已有意见' });
+      h.gets[0].resolve(jsonResponse(200, { ideas: [existing] }));
+      await flush();
+
+      h.setForm(c.values);
+      await h.submit();
+
+      // 前端校验必须拦住请求，不能把超限内容发给服务端
+      assert.equal(h.postsIssued, 0, c.name);
+      assert.equal(h.els.error.hidden, false, c.name);
+      assert.equal(h.els.error.textContent, c.message, c.name);
+      assert.equal(h.els.success.hidden, true, c.name);
+      // 三个输入框内容全部保留，便于用户改短而不是重填
+      assert.equal(h.els['f-title'].value, c.values.title, c.name);
+      assert.equal(h.els['f-desc'].value, c.values.description, c.name);
+      assert.equal(h.els['f-scenario'].value, c.values.scenario ?? '', c.name);
+      // 列表不增加任何记录，已有记录保留
+      assert.deepEqual(h.titles(), ['已有意见'], c.name);
+    });
+  }
+});
+
+test('首尾空白要区分对待：带首尾空白的合法上限标题可以提交；被空白推到超限的详细说明必须拒绝', async () => {
+  // 前者：首尾空白在判定前去trim，内部 120 码点，首尾空白再多也允许，保存的是去空白标题
+  const h1 = new Harness(pageScript);
+  const paddedTitle = '   ' + repeatCp('中', 120) + '  ';
+  assert.equal(codePointCount(paddedTitle.trim()), 120);
+  h1.setForm({ title: paddedTitle, description: '说明' });
+  const first = h1.submit();
+  assert.equal(h1.postsIssued, 1);
+  const saved = makeIdea({ id: 'a', title: paddedTitle.trim(), description: '说明' });
+  h1.posts[0].resolve(jsonResponse(201, { idea: saved }));
+  await first;
+  await flush();
+  assert.equal(h1.els.error.hidden, true);
+  assert.equal(h1.els.success.hidden, false);
+  assert.deepEqual(h1.titles(), [paddedTitle.trim()]);
+
+  // 后者：非空白内容只有 4998 码点，但首尾 3 个空白把整条详细说明推到 5001 码点，必须拒绝
+  const h2 = new Harness(pageScript);
+  const paddedDescription = '  ' + repeatCp('中', 4998) + ' ';
+  assert.equal(codePointCount(paddedDescription), 5001);
+  assert.ok(codePointCount(paddedDescription.trim()) < 5000, '去掉空白后并未超限，用以证明计数含首尾空白');
+  h2.setForm({ title: '有效标题', description: paddedDescription, scenario: '场景' });
+  await h2.submit();
+  assert.equal(h2.postsIssued, 0);
+  assert.equal(h2.els.error.textContent, DESC_LIMIT_ERROR);
+  assert.equal(h2.els.success.hidden, true);
+  assert.equal(h2.els['f-desc'].value, paddedDescription);
+  assert.equal(h2.articles().length, 0);
+});
+
+test('使用场景省略为空字符串仍可提交；场景首尾空白计入长度', async () => {
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: [] }));
+  await flush();
+
+  h.setForm({ title: '空场景标题', description: '说明', scenario: '' });
+  const submitted = h.submit();
+  assert.equal(h.postsIssued, 1);
+  assert.deepEqual(JSON.parse(h.postBodies[0] as string), {
+    title: '空场景标题',
+    description: '说明',
+    scenario: '',
+  });
+  h.posts[0].resolve(jsonResponse(201, { idea: makeIdea({ id: 'a', title: '空场景标题', description: '说明', scenario: '' }) }));
+  await submitted;
+  await flush();
+  assert.equal(h.els.success.hidden, false);
+
+  // 999 中文 + 首尾两个空格 = 1001 码点：场景按原文计数，空白不能豁免
+  const h2 = new Harness(pageScript);
+  const paddedScenario = ' ' + repeatCp('中', 999) + ' ';
+  assert.equal(codePointCount(paddedScenario), 1001);
+  h2.setForm({ title: '标题', description: '说明', scenario: paddedScenario });
+  await h2.submit();
+  assert.equal(h2.postsIssued, 0);
+  assert.equal(h2.els.error.textContent, SCENARIO_LIMIT_ERROR);
+  assert.equal(h2.els['f-scenario'].value, paddedScenario);
+});
+
+test('超限被拦后把字段缩短到允许范围：可以正常提交，之前的错误不继续阻止保存', async (t) => {
+  await t.test('标题缩短后提交成功', async () => {
+    const h = new Harness(pageScript);
+    h.gets[0].resolve(jsonResponse(200, { ideas: [] }));
+    await flush();
+
+    h.setForm({ title: repeatCp('中', 121), description: '先超长后改短的说明', scenario: '场景' });
+    await h.submit();
+    assert.equal(h.postsIssued, 0);
+    assert.equal(h.els.error.textContent, TITLE_LIMIT_ERROR);
+
+    // 模拟用户把标题改到恰好上限；其余字段不动
+    h.edit('f-title', repeatCp('中', 120));
+    const retried = h.submit();
+    assert.equal(h.postsIssued, 1, '只有缩短后的这一次真正发出请求');
+    assert.equal(h.els.error.hidden, true);
+    h.posts[0].resolve(jsonResponse(201, { idea: makeIdea({ id: 'a', title: repeatCp('中', 120), description: '先超长后改短的说明', scenario: '场景' }) }));
+    await retried;
+    await flush();
+
+    assert.equal(h.els.success.hidden, false);
+    assert.equal(h.els.success.textContent, SUCCESS_TEXT);
+    assert.equal(h.els.error.hidden, true);
+    assert.equal(h.els['f-title'].value, '');
+    assert.equal(h.els['f-desc'].value, '');
+    assert.equal(h.els['f-scenario'].value, '');
+    assert.equal(h.articles().length, 1);
+  });
+
+  await t.test('被空白推超限的详细说明删一个首尾空白后提交成功，内容原样保留', async () => {
+    const h = new Harness(pageScript);
+    const tooLong = '  ' + repeatCp('中', 4998) + ' ';
+    assert.equal(codePointCount(tooLong), 5001);
+    h.setForm({ title: '标题', description: tooLong });
+    await h.submit();
+    assert.equal(h.postsIssued, 0);
+    assert.equal(h.els.error.textContent, DESC_LIMIT_ERROR);
+
+    const fixed = tooLong.trimStart() + '\n'; // 5000 码点，仍保留首尾空白与换行
+    assert.equal(codePointCount(fixed), 5000);
+    h.edit('f-desc', fixed);
+    const retried = h.submit();
+    assert.equal(h.postsIssued, 1);
+    h.posts[0].resolve(jsonResponse(201, { idea: makeIdea({ id: 'b', title: '标题', description: fixed }) }));
+    await retried;
+    await flush();
+
+    assert.equal(h.els.success.hidden, false);
+    assert.equal(h.els.error.hidden, true);
+    assertArticleMatches(h.articles()[0], makeIdea({ id: 'b', title: '标题', description: fixed }));
+  });
+});
