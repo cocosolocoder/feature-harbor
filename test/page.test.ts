@@ -135,6 +135,7 @@ class Harness {
   getsIssued = 0;
   posts: Gate[] = [];
   postsIssued = 0;
+  postBodies: unknown[] = [];
 
   constructor(script: string) {
     const byId: Map<string, El> = new Map();
@@ -162,12 +163,13 @@ class Harness {
       getElementById: (id: string): El => byId.get(id)!,
       createElement: (tag: string): El => makeElement(tag),
     };
-    const fetchMock = (url: unknown, init?: { method?: string }): Promise<unknown> => {
+    const fetchMock = (url: unknown, init?: { method?: string; body?: unknown }): Promise<unknown> => {
       const method = init?.method ?? 'GET';
       const pending = gate();
       if (method === 'POST') {
         this.posts.push(pending);
         this.postsIssued += 1;
+        this.postBodies.push(init?.body);
       } else {
         this.gets.push(pending);
         this.getsIssued += 1;
@@ -182,6 +184,13 @@ class Harness {
     if (values.title !== undefined) this.els['f-title'].value = values.title;
     if (values.description !== undefined) this.els['f-desc'].value = values.description;
     if (values.scenario !== undefined) this.els['f-scenario'].value = values.scenario;
+  }
+
+  // 模拟真实用户输入：赋值并触发 input 事件（setForm 不触发事件，只用于布置初始状态）
+  edit(id: string, value: string): void {
+    const el = this.els[id];
+    el.value = value;
+    for (const fn of el.listeners.input ?? []) fn({ target: el });
   }
 
   // 触发表单 submit 监听器，返回监听器（async 函数）的 Promise
@@ -551,4 +560,168 @@ test('整个过程只发起一次首次列表请求，提交动作不会触发�
   await submitted;
   await flush();
   assert.equal(h.getsIssued, 1);
+});
+
+test('等待提交返回期间继续编辑：成功后完整保留草稿（含未改动字段、空白与换行），已保存意见仍入列表', async () => {
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: [] }));
+  await flush();
+
+  h.setForm({ title: '第一条标题', description: '第一条说明', scenario: '第一条场景' });
+  const submitted = h.submit();
+  assert.equal(h.posts.length, 1);
+
+  // 等待期间开始写下一条：改动标题与场景，详细说明保持不动
+  h.edit('f-title', '第二条\n 标题  ');
+  h.edit('f-scenario', '新场景\n\n含换行');
+
+  const mine = makeIdea({ id: 'a', title: '第一条标题', description: '第一条说明', scenario: '第一条场景' });
+  h.posts[0].resolve(jsonResponse(201, { idea: mine }));
+  await submitted;
+  await flush();
+
+  // 发送的仍是点击提交时的快照，等待期间的新输入不能混入
+  assert.deepEqual(JSON.parse(h.postBodies[0] as string), {
+    title: '第一条标题',
+    description: '第一条说明',
+    scenario: '第一条场景',
+  });
+  // 三个输入框完整保留此刻内容，包括未改动的详细说明
+  assert.equal(h.els['f-title'].value, '第二条\n 标题  ');
+  assert.equal(h.els['f-desc'].value, '第一条说明');
+  assert.equal(h.els['f-scenario'].value, '新场景\n\n含换行');
+  // 仍提示上一条已保存，并按服务端返回的记录展示
+  assert.equal(h.els.success.hidden, false);
+  assert.equal(h.els.success.textContent, SUCCESS_TEXT);
+  const articles = h.articles();
+  assert.equal(articles.length, 1);
+  assertArticleMatches(articles[0], mine);
+});
+
+test('等待期间修改后又改回原文：仍属继续编辑，成功响应保留当前草稿', async () => {
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: [] }));
+  await flush();
+
+  h.setForm({ title: '原标题', description: '原说明', scenario: '原场景' });
+  const submitted = h.submit();
+  h.edit('f-title', '临时改动');
+  h.edit('f-title', '原标题');
+
+  h.posts[0].resolve(jsonResponse(201, { idea: makeIdea({ id: 'a', title: '原标题' }) }));
+  await submitted;
+  await flush();
+
+  assert.equal(h.els['f-title'].value, '原标题');
+  assert.equal(h.els['f-desc'].value, '原说明');
+  assert.equal(h.els['f-scenario'].value, '原场景');
+  assert.equal(h.els.success.hidden, false);
+});
+
+test('等待期间清空某个字段：成功响应不清表单，保留清空后的状态', async () => {
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: [] }));
+  await flush();
+
+  h.setForm({ title: '标题', description: '说明', scenario: '场景' });
+  const submitted = h.submit();
+  h.edit('f-scenario', '');
+
+  h.posts[0].resolve(jsonResponse(201, { idea: makeIdea({ id: 'a' }) }));
+  await submitted;
+  await flush();
+
+  assert.equal(h.els['f-title'].value, '标题');
+  assert.equal(h.els['f-desc'].value, '说明');
+  assert.equal(h.els['f-scenario'].value, '');
+  assert.equal(h.els.success.hidden, false);
+});
+
+test('等待期间保留的草稿可以直接再次提交：按原有规则校验并保存，不被当成已保存内容', async () => {
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: [] }));
+  await flush();
+
+  h.setForm({ title: '第一条', description: '第一条说明' });
+  const first = h.submit();
+  h.edit('f-title', '第二条草稿');
+  h.edit('f-desc', '第二条说明');
+  h.posts[0].resolve(jsonResponse(201, { idea: makeIdea({ id: 'a', title: '第一条' }) }));
+  await first;
+  await flush();
+  // 草稿未被自动提交
+  assert.equal(h.postsIssued, 1);
+  assert.deepEqual(h.titles(), ['第一条']);
+
+  const secondIdea = makeIdea({ id: 'b', title: '第二条草稿', description: '第二条说明' });
+  const second = h.submit();
+  assert.equal(h.postsIssued, 2);
+  assert.deepEqual(JSON.parse(h.postBodies[1] as string), {
+    title: '第二条草稿',
+    description: '第二条说明',
+    scenario: '',
+  });
+  h.posts[1].resolve(jsonResponse(201, { idea: secondIdea }));
+  await second;
+  await flush();
+
+  // 第二次提交后未再编辑，表单清空；两条意见各自出现在列表里
+  assert.equal(h.els['f-title'].value, '');
+  assert.equal(h.els['f-desc'].value, '');
+  assert.deepEqual(h.titles(), ['第二条草稿', '第一条']);
+});
+
+test('两条提交同时在途：较早请求后返回也不能清除后一次提交之后输入的内容，两条意见都入列表', async () => {
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: [] }));
+  await flush();
+
+  h.setForm({ title: '先提交', description: '先提交的说明' });
+  const first = h.submit();
+  h.setForm({ title: '后提交', description: '后提交的说明' });
+  const second = h.submit();
+  assert.equal(h.posts.length, 2);
+
+  // 后一次提交之后继续输入新草稿
+  h.edit('f-title', '正在写的第三条');
+
+  // 较早的请求后返回成功
+  h.posts[0].resolve(jsonResponse(201, { idea: makeIdea({ id: 'a', title: '先提交' }) }));
+  await first;
+  await flush();
+  assert.equal(h.els['f-title'].value, '正在写的第三条');
+  assert.equal(h.els['f-desc'].value, '后提交的说明');
+  assert.deepEqual(h.titles(), ['先提交']);
+
+  h.posts[1].resolve(jsonResponse(201, { idea: makeIdea({ id: 'b', title: '后提交' }) }));
+  await second;
+  await flush();
+  assert.equal(h.els['f-title'].value, '正在写的第三条');
+  assert.equal(h.els['f-desc'].value, '后提交的说明');
+  assert.deepEqual(h.titles(), ['后提交', '先提交']);
+});
+
+test('两条提交在途且期间未编辑：先返回的成功清空表单，后返回的成功各自把意见放入列表', async () => {
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: [] }));
+  await flush();
+
+  h.setForm({ title: '同文意见', description: '同样的说明' });
+  const first = h.submit();
+  const second = h.submit();
+  assert.equal(h.posts.length, 2);
+
+  h.posts[0].resolve(jsonResponse(201, { idea: makeIdea({ id: 'a', title: '同文意见', description: '同样的说明' }) }));
+  await first;
+  await flush();
+  assert.equal(h.els['f-title'].value, '');
+
+  h.posts[1].resolve(jsonResponse(201, { idea: makeIdea({ id: 'b', title: '同文意见', description: '同样的说明' }) }));
+  await second;
+  await flush();
+
+  // 标题、正文相同但 id 不同，两条记录分别显示，不合并
+  const articles = h.articles();
+  assert.equal(articles.length, 2);
+  assert.deepEqual(h.titles(), ['同文意见', '同文意见']);
 });

@@ -123,6 +123,12 @@ async function loadIdeas() {
   }
   renderList();
 }
+// 任一字段每次发生编辑都递增；提交时记下当前版本，成功响应到达时若版本未变，
+// 说明等待期间没有继续编辑，才清空表单，否则保留正在写的草稿
+let editVersion = 0;
+for (const field of [titleInput, descInput, scenarioInput]) {
+  field.addEventListener('input', () => { editVersion += 1; });
+}
 function validate(title, description, scenario) {
   const trimmed = title.trim();
   if (!trimmed) return '标题不能为空。';
@@ -139,6 +145,7 @@ form.addEventListener('submit', async (event) => {
   const title = titleInput.value;
   const description = descInput.value;
   const scenario = scenarioInput.value;
+  const submittedVersion = editVersion;
   const problem = validate(title, description, scenario);
   if (problem) { showError(problem); return; }
   let res;
@@ -158,7 +165,9 @@ form.addEventListener('submit', async (event) => {
     showError(data && data.error ? '提交失败：' + data.error : '提交失败，请稍后重试。');
     return;
   }
-  form.reset();
+  // 只有等待期间没有继续编辑（包括改回原文、清空字段也算编辑）才清空表单；
+  // 否则完整保留此刻的草稿，成功提示与列表仍按本次提交的记录更新
+  if (editVersion === submittedVersion) form.reset();
   successBox.textContent = '提交成功，你的意见已保存。';
   successBox.hidden = false;
   // 只把已确认保存的意见并入列表，随后统一渲染，避免与首次列表响应相互覆盖
