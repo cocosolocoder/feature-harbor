@@ -123,6 +123,13 @@ async function loadIdeas() {
   }
   renderList();
 }
+// 表单编辑计数：任一字段的每次输入都会让它增加。提交时记下当时的计数，
+// 成功响应到达时若计数未变，说明等待期间没有继续编辑，才能安全清空表单；
+// 否则保留用户正在写的草稿（包括改过又改回、清空某字段等情况）。
+let editVersion = 0;
+for (const field of [titleInput, descInput, scenarioInput]) {
+  field.addEventListener('input', () => { editVersion += 1; });
+}
 function validate(title, description, scenario) {
   const trimmed = title.trim();
   if (!trimmed) return '标题不能为空。';
@@ -141,6 +148,8 @@ form.addEventListener('submit', async (event) => {
   const scenario = scenarioInput.value;
   const problem = validate(title, description, scenario);
   if (problem) { showError(problem); return; }
+  // 本次提交只负责它点击时的快照；等待期间的继续编辑不应被这次响应清除
+  const submitVersion = editVersion;
   let res;
   try {
     res = await fetch('/api/ideas', {
@@ -158,7 +167,9 @@ form.addEventListener('submit', async (event) => {
     showError(data && data.error ? '提交失败：' + data.error : '提交失败，请稍后重试。');
     return;
   }
-  form.reset();
+  // 只有等待期间没有继续编辑时才清空表单；否则完整保留当前草稿，
+  // 但已确认保存的意见仍照常提示成功并并入列表
+  if (editVersion === submitVersion) form.reset();
   successBox.textContent = '提交成功，你的意见已保存。';
   successBox.hidden = false;
   // 只把已确认保存的意见并入列表，随后统一渲染，避免与首次列表响应相互覆盖
