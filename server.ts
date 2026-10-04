@@ -111,12 +111,29 @@ function renderList() {
     emptyNote.hidden = true;
   }
 }
+// 一条有效意见必须是 JSON 对象：id 为非空字符串，
+// title、description、scenario、createdAt 均为字符串（scenario 允许为空字符串）
+function isValidIdea(idea) {
+  if (typeof idea !== 'object' || idea === null || Array.isArray(idea)) return false;
+  if (typeof idea.id !== 'string' || idea.id.length === 0) return false;
+  for (const field of ['title', 'description', 'scenario', 'createdAt']) {
+    if (typeof idea[field] !== 'string') return false;
+  }
+  return true;
+}
 async function loadIdeas() {
   try {
     const res = await fetch('/api/ideas');
     if (!res.ok) throw new Error('load failed');
     const data = await res.json();
-    remoteIdeas = Array.isArray(data.ideas) ? data.ideas : [];
+    // 列表响应必须是带 ideas 数组的 JSON 对象，且数组中每条记录都合法；
+    // 顶层结构异常或任意一条记录异常都属于整次加载失败，
+    // 即使异常记录前面有正常意见，也不能只展示其中一部分
+    if (typeof data !== 'object' || data === null || Array.isArray(data) || !Array.isArray(data.ideas)) {
+      throw new Error('invalid ideas response');
+    }
+    if (!data.ideas.every(isValidIdea)) throw new Error('invalid idea record');
+    remoteIdeas = data.ideas;
     listState = 'ready';
   } catch {
     listState = 'failed';

@@ -402,6 +402,124 @@ test('首次列表返回 500：视为加载失败而不是空列表', async () =
   assert.equal(h.els.empty.textContent, LOAD_FAILED_TEXT);
 });
 
+test('首次列表响应体不是有效 JSON：视为加载失败而不是空列表', async () => {
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(brokenJsonResponse(200));
+  await flush();
+
+  assert.equal(h.els.empty.hidden, false);
+  assert.equal(h.els.empty.textContent, LOAD_FAILED_TEXT);
+});
+
+test('顶层结构异常（空值、数组、其他类型或 ideas 缺失/不是数组）：一律视为加载失败', async (t) => {
+  const validIdea = makeIdea({ id: 'r1' });
+  const cases = [
+    { name: '顶层为 null', body: null },
+    { name: '顶层为数组', body: [{ ideas: [] }] },
+    { name: '顶层为字符串', body: 'oops' },
+    { name: '顶层为数字', body: 42 },
+    { name: '缺少 ideas 字段', body: {} },
+    { name: 'ideas 为 null', body: { ideas: null } },
+    { name: 'ideas 为对象', body: { ideas: {} } },
+    { name: 'ideas 为字符串', body: { ideas: JSON.stringify([validIdea]) } },
+  ];
+  for (const c of cases) {
+    await t.test(c.name, async () => {
+      const h = new Harness(pageScript);
+      h.gets[0].resolve(jsonResponse(200, c.body));
+      await flush();
+
+      assert.equal(h.els.empty.hidden, false, c.name);
+      assert.equal(h.els.empty.textContent, LOAD_FAILED_TEXT, c.name);
+      assert.equal(h.articles().length, 0, c.name);
+    });
+  }
+});
+
+test('数组中混入异常记录（空值、数组、非对象、缺字段、字段类型不符、空 id）：整次加载失败', async (t) => {
+  const good = (): Record<string, unknown> => makeIdea({ id: 'r1' });
+  const cases = [
+    { name: '混入 null', record: null },
+    { name: '混入数组', record: [] },
+    { name: '混入字符串', record: 'r1' },
+    { name: '混入数字', record: 1 },
+    { name: '缺少 id', record: (() => { const r = good(); delete r.id; return r; })() },
+    { name: 'id 为空字符串', record: { ...good(), id: '' } },
+    { name: 'id 为数字', record: { ...good(), id: 1 } },
+    { name: '缺少 title', record: (() => { const r = good(); delete r.title; return r; })() },
+    { name: 'title 为数字', record: { ...good(), title: 1 } },
+    { name: '缺少 description', record: (() => { const r = good(); delete r.description; return r; })() },
+    { name: 'description 为 null', record: { ...good(), description: null } },
+    { name: '缺少 scenario', record: (() => { const r = good(); delete r.scenario; return r; })() },
+    { name: 'scenario 为数字', record: { ...good(), scenario: 0 } },
+    { name: '缺少 createdAt', record: (() => { const r = good(); delete r.createdAt; return r; })() },
+    { name: 'createdAt 为数字', record: { ...good(), createdAt: 0 } },
+  ];
+  for (const c of cases) {
+    await t.test(c.name, async () => {
+      const h = new Harness(pageScript);
+      h.gets[0].resolve(jsonResponse(200, { ideas: [good(), c.record] }));
+      await flush();
+
+      assert.equal(h.els.empty.hidden, false, c.name);
+      assert.equal(h.els.empty.textContent, LOAD_FAILED_TEXT, c.name);
+      // 即使异常记录前有正常意见，也不能只展示其中一部分
+      assert.equal(h.articles().length, 0, c.name);
+    });
+  }
+});
+
+test('scenario 为空字符串是正常记录：空场景响应按成功处理，不显示加载失败提示', async () => {
+  const h = new Harness(pageScript);
+  const idea = makeIdea({ id: 'r1', title: '空场景意见', scenario: '' });
+  h.gets[0].resolve(jsonResponse(200, { ideas: [idea] }));
+  await flush();
+
+  assert.equal(h.els.empty.hidden, true);
+  assert.deepEqual(h.titles(), ['空场景意见']);
+});
+
+test('提交先确认保存、随后列表响应含异常记录：已保存意见与成功提示保留，同时显示加载失败，且不部分展示远端记录', async () => {
+  const h = new Harness(pageScript);
+  const mine = makeIdea({ id: 'a', title: '已保存的意见' });
+  h.setForm({ title: '已保存的意见', description: '说明' });
+  const submitted = h.submit();
+  h.posts[0].resolve(jsonResponse(201, { idea: mine }));
+  await submitted;
+
+  // 异常记录前有一条正常远端记录，也不能把它当作完整列表的一部分展示
+  const remote = makeIdea({ id: 'r1', title: '远端已有意见' });
+  h.gets[0].resolve(jsonResponse(200, { ideas: [remote, null] }));
+  await flush();
+
+  assert.deepEqual(h.titles(), ['已保存的意见']);
+  assert.equal(h.els.empty.hidden, false);
+  assert.equal(h.els.empty.textContent, LOAD_FAILED_TEXT);
+  assert.equal(h.els.success.hidden, false);
+  assert.equal(h.els.success.textContent, SUCCESS_TEXT);
+});
+
+test('列表响应异常时正在填写的草稿三个字段不受影响', async () => {
+  const h = new Harness(pageScript);
+  const mine = makeIdea({ id: 'a', title: '上一条意见' });
+  h.setForm({ title: '上一条意见', description: '上一条说明' });
+  const submitted = h.submit();
+  h.posts[0].resolve(jsonResponse(201, { idea: mine }));
+  await submitted;
+
+  // 列表返回前正在填写下一条
+  h.edit('f-title', '正在写的标题');
+  h.edit('f-desc', '正在写的说明');
+  h.edit('f-scenario', '正在写的场景');
+  h.gets[0].resolve(jsonResponse(200, { ideas: null }));
+  await flush();
+
+  assert.equal(h.els['f-title'].value, '正在写的标题');
+  assert.equal(h.els['f-desc'].value, '正在写的说明');
+  assert.equal(h.els['f-scenario'].value, '正在写的场景');
+  assert.equal(h.els.empty.textContent, LOAD_FAILED_TEXT);
+});
+
 test('首次列表加载失败后提交成功：新意见与加载失败提示同时可见，成功提示不掩盖加载问题', async () => {
   const h = new Harness(pageScript);
   h.gets[0].reject(new TypeError('Failed to fetch'));
