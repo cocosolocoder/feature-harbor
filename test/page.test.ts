@@ -438,6 +438,78 @@ test('提交成功后首次列表才失败：不清除已提交意见，同时�
   assert.equal(h.els.empty.textContent, LOAD_FAILED_TEXT);
 });
 
+test('首次列表响应结构或记录异常：统一视为加载失败，不部分展示、不当作空列表', async (t) => {
+  const malformed: Array<[string, unknown]> = [
+    ['顶层为 null', null],
+    ['顶层为数组', []],
+    ['顶层为字符串', 'oops'],
+    ['顶层为数字', 42],
+    ['缺少 ideas 字段', { foo: [] }],
+    ['ideas 是对象', { ideas: {} }],
+    ['ideas 是字符串', { ideas: 'x' }],
+    ['ideas 为 null', { ideas: null }],
+    ['记录为 null', { ideas: [null] }],
+    ['记录为数组', { ideas: [[]] }],
+    ['记录为字符串', { ideas: ['x'] }],
+    ['记录缺少 id', { ideas: [makeIdea({ id: undefined })] }],
+    ['id 为空字符串', { ideas: [makeIdea({ id: '' })] }],
+    ['id 不是字符串', { ideas: [makeIdea({ id: 7 })] }],
+    ['缺少 title', { ideas: [makeIdea({ title: undefined })] }],
+    ['title 不是字符串', { ideas: [makeIdea({ title: 7 })] }],
+    ['缺少 description', { ideas: [makeIdea({ description: undefined })] }],
+    ['缺少 scenario', { ideas: [makeIdea({ scenario: undefined })] }],
+    ['scenario 不是字符串', { ideas: [makeIdea({ scenario: 7 })] }],
+    ['缺少 createdAt', { ideas: [makeIdea({ createdAt: undefined })] }],
+    ['createdAt 不是字符串', { ideas: [makeIdea({ createdAt: 7 })] }],
+    ['前面正常、后面混入 null', { ideas: [makeIdea({ id: 'ok' }), null] }],
+    ['前面正常、后面记录字段类型不符', { ideas: [makeIdea({ id: 'ok' }), makeIdea({ title: 7 })] }],
+  ];
+  for (const [name, body] of malformed) {
+    await t.test(name, async () => {
+      const h = new Harness(pageScript);
+      h.gets[0].resolve(jsonResponse(200, body));
+      await flush();
+      assert.equal(h.els.empty.hidden, false, '应给出提示而不是静默空白');
+      assert.equal(h.els.empty.textContent, LOAD_FAILED_TEXT);
+      assert.equal(h.articles().length, 0, '异常响应中的部分记录不能上屏');
+    });
+  }
+});
+
+test('scenario 为空字符串的正常记录仍按接口次序展示，不被误判为异常', async () => {
+  const h = new Harness(pageScript);
+  const r1 = makeIdea({ id: 'r1', title: '意见一', scenario: '' });
+  const r2 = makeIdea({ id: 'r2', title: '意见二', scenario: '夜间使用' });
+  h.gets[0].resolve(jsonResponse(200, { ideas: [r1, r2] }));
+  await flush();
+  assert.equal(h.els.empty.hidden, true);
+  const articles = h.articles();
+  assert.equal(articles.length, 2);
+  assertArticleMatches(articles[0], r1);
+  assertArticleMatches(articles[1], r2);
+});
+
+test('提交已确认保存后列表响应异常：已保存意见与成功提示保留，同时显示加载失败，草稿不动', async () => {
+  const h = new Harness(pageScript);
+  h.setForm({ title: '我的意见', description: '说明', scenario: '场景' });
+  const submitted = h.submit();
+  const mine = makeIdea({ id: 'mine', title: '我的意见', description: '说明', scenario: '场景' });
+  h.posts[0].resolve(jsonResponse(201, { idea: mine }));
+  await submitted;
+
+  // 响应里前面的记录看似正常，但末尾混入异常记录，整体仍判失败
+  h.gets[0].resolve(jsonResponse(200, { ideas: [makeIdea({ id: 'ok' }), null] }));
+  await flush();
+
+  const articles = h.articles();
+  assert.equal(articles.length, 1);
+  assertArticleMatches(articles[0], mine);
+  assert.equal(h.els.empty.hidden, false);
+  assert.equal(h.els.empty.textContent, LOAD_FAILED_TEXT);
+  assert.equal(h.els.success.hidden, false);
+  assert.equal(h.els.success.textContent, SUCCESS_TEXT);
+});
+
 test('提交网络失败：保留表单内容、提示提交失败、不显示成功、不插入列表，已有记录保留', async () => {
   const h = new Harness(pageScript);
   const r1 = makeIdea({ id: 'r1', title: '已有意见' });

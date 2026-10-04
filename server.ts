@@ -111,14 +111,34 @@ function renderList() {
     emptyNote.hidden = true;
   }
 }
+// 严格校验一次列表响应：顶层必须是带有 ideas 数组的 JSON 对象，
+// 数组中每条意见都必须是对象，且 id 为非空字符串、
+// title/description/scenario/createdAt 均为字符串（scenario 允许为空字符串）。
+// 任意一条不合规就整体判为失败、返回 null，避免把半截列表当作完整结果展示。
+function parseIdeasResponse(data) {
+  if (typeof data !== 'object' || data === null || Array.isArray(data)) return null;
+  const ideas = data.ideas;
+  if (!Array.isArray(ideas)) return null;
+  for (const idea of ideas) {
+    if (typeof idea !== 'object' || idea === null || Array.isArray(idea)) return null;
+    if (typeof idea.id !== 'string' || idea.id.length === 0) return null;
+    for (const field of ['title', 'description', 'scenario', 'createdAt']) {
+      if (typeof idea[field] !== 'string') return null;
+    }
+  }
+  return ideas;
+}
 async function loadIdeas() {
   try {
     const res = await fetch('/api/ideas');
     if (!res.ok) throw new Error('load failed');
-    const data = await res.json();
-    remoteIdeas = Array.isArray(data.ideas) ? data.ideas : [];
+    // 整条响应（含每一条记录）校验通过后才整体替换，异常记录不会部分上屏
+    const ideas = parseIdeasResponse(await res.json());
+    if (ideas === null) throw new Error('invalid response');
+    remoteIdeas = ideas;
     listState = 'ready';
   } catch {
+    // 网络失败、非成功状态、无法解析的 JSON、响应结构或记录异常都归为同一种加载失败
     listState = 'failed';
   }
   renderList();
