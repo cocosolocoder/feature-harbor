@@ -178,8 +178,16 @@ form.addEventListener('submit', async (event) => {
   }
   let data = null;
   try { data = await res.json(); } catch { data = null; }
-  if (!res.ok || !data || !data.idea) {
+  if (!res.ok) {
     showError(data && data.error ? '提交失败：' + data.error : '提交失败，请稍后重试。');
+    return;
+  }
+  // 成功状态的响应同样必须结构完整：顶层是含 idea 的 JSON 对象，
+  // 且 idea 本身通过 isValidIdea 校验（对象、非空 id、各字段均为字符串）。
+  // 空对象、数组或缺字段的记录不能当作保存成功：不显示成功提示、
+  // 不清空草稿、不并入列表，也不用表单内容补齐响应缺失的信息
+  if (typeof data !== 'object' || data === null || Array.isArray(data) || !isValidIdea(data.idea)) {
+    showError('提交失败，请稍后重试。');
     return;
   }
   // 只有等待期间没有继续编辑（包括改回原文、清空字段也算编辑）才清空表单；
