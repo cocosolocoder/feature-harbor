@@ -3,13 +3,69 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import vm from 'node:vm';
 
 const PRODUCT: string = 'FeatureHarbor';
 const RESOURCE: string = 'ideas';
-const MAX_TITLE = 120;
-const MAX_DESCRIPTION = 5000;
-const MAX_SCENARIO = 1000;
 const MAX_BODY_BYTES = 1_000_000;
+// 字段校验规则的唯一来源：标题、详细说明、使用场景三项的上限、空白处理与拒绝原因。
+// 服务端提交接口通过 vm 编译这段源码执行（不依赖页面是否被请求过），首页内联脚本
+// 则把它逐字嵌入，两个入口共用同一份判定，同一批合法文字的接受/拒绝结果必然一致。
+// 上限、页面说明与两侧提示均从这里取数，不再各自维护。
+const FIELD_RULES_SOURCE: string = `
+const IDEA_FIELD_RULES = {
+  title: { label: '标题', max: 120, trim: true,
+    emptyCode: 'title-empty', limitCode: 'title-too-long' },
+  description: { label: '详细说明', max: 5000, trim: false,
+    emptyCode: 'description-empty', limitCode: 'description-too-long' },
+  scenario: { label: '使用场景', max: 1000, trim: false,
+    emptyCode: null, limitCode: 'scenario-too-long' },
+};
+// 长度一律按 Unicode 码点计算：中文、英文字母、单个 😀 各算一个码点；
+// 旗帜、ZWJ 表情、组合字符等由多个码点组成的文字按各自码点累计，不能当成一个字符
+function ideaCodePoints(text) { return Array.from(text).length; }
+// 校验已确认都是字符串的三个字段（使用场景缺省传 ''）。
+// 标题先去首尾空白再判空、计长，保存去空白结果，内部空白保留并计入；
+// 详细说明与使用场景按原文计长（首尾空白与换行都计入），详细说明还须含非空白内容。
+// 返回首个不合要求字段的问题代码（字段顺序：标题、详细说明、使用场景），全部合法返回 null。
+function validateIdeaFields(title, description, scenario) {
+  for (const [name, value] of [['title', title], ['description', description], ['scenario', scenario]]) {
+    const rule = IDEA_FIELD_RULES[name];
+    const effective = rule.trim ? value.trim() : value;
+    if (rule.emptyCode !== null && !effective.trim()) return rule.emptyCode;
+    if (ideaCodePoints(effective) > rule.max) return rule.limitCode;
+  }
+  return null;
+}
+// 校验通过后的规范化结果：标题保存去掉首尾空白后的内容，其余原样保存
+function normalizeIdeaFields(title, description, scenario) {
+  return { title: title.trim(), description, scenario };
+}
+`;
+interface FieldRulesApi {
+  IDEA_FIELD_RULES: Record<string, { label: string; max: number; trim: boolean; emptyCode: string | null; limitCode: string }>;
+  ideaCodePoints(text: string): number;
+  validateIdeaFields(title: string, description: string, scenario: string): string | null;
+  normalizeIdeaFields(title: string, description: string, scenario: string): { title: string; description: string; scenario: string };
+}
+const fieldRulesContext = vm.createContext({});
+vm.runInContext(FIELD_RULES_SOURCE, fieldRulesContext, { filename: 'field-rules.shared.js' });
+// 顶层 const 绑定在上下文的词法作用域中，不作为上下文对象的属性暴露，
+// 在同一上下文里再求值标识符即可取到
+const fieldRules: FieldRulesApi = {
+  IDEA_FIELD_RULES: vm.runInContext('IDEA_FIELD_RULES', fieldRulesContext),
+  ideaCodePoints: vm.runInContext('ideaCodePoints', fieldRulesContext),
+  validateIdeaFields: vm.runInContext('validateIdeaFields', fieldRulesContext),
+  normalizeIdeaFields: vm.runInContext('normalizeIdeaFields', fieldRulesContext),
+};
+// 接口侧的问题代码 → 400 错误说明（接口原有措辞）
+const API_FIELD_ERRORS: Record<string, string> = {
+  'title-empty': '标题去掉首尾空白后不能为空',
+  'title-too-long': `标题最多 ${fieldRules.IDEA_FIELD_RULES.title.max} 个字符`,
+  'description-empty': '详细说明必须包含非空白内容',
+  'description-too-long': `详细说明最多 ${fieldRules.IDEA_FIELD_RULES.description.max} 个字符`,
+  'scenario-too-long': `使用场景最多 ${fieldRules.IDEA_FIELD_RULES.scenario.max} 个字符`,
+};
 const PAGE: string = `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>FeatureHarbor · 产品意见与公开路线图</title><style>
 body{font-family:system-ui,sans-serif;max-width:52rem;margin:3rem auto;padding:0 1rem;line-height:1.7}
 a{color:#175b9c}
@@ -27,11 +83,11 @@ time{color:#666;font-size:.9rem}
 </style><main><h1>FeatureHarbor</h1><p>产品意见与公开路线图</p>
 <h2>提交产品意见</h2>
 <form id="idea-form" novalidate>
-<label for="f-title">标题 <span class="required">*</span>（必填，最多 120 字）</label>
+<label for="f-title">标题 <span class="required">*</span>（必填，最多 ${fieldRules.IDEA_FIELD_RULES.title.max} 字）</label>
 <input id="f-title" name="title" required>
-<label for="f-desc">详细说明 <span class="required">*</span>（必填，最多 5000 字）</label>
+<label for="f-desc">详细说明 <span class="required">*</span>（必填，最多 ${fieldRules.IDEA_FIELD_RULES.description.max} 字）</label>
 <textarea id="f-desc" name="description" rows="5" required></textarea>
-<label for="f-scenario">使用场景（可选，最多 1000 字）</label>
+<label for="f-scenario">使用场景（可选，最多 ${fieldRules.IDEA_FIELD_RULES.scenario.max} 字）</label>
 <textarea id="f-scenario" name="scenario" rows="3"></textarea>
 <button type="submit">提交意见</button>
 <p id="error" role="alert" hidden></p>
@@ -42,6 +98,7 @@ time{color:#666;font-size:.9rem}
 <div id="ideas"></div>
 <p><a href="/api/ideas">查看意见列表接口</a> · <a href="/health">服务状态</a></p>
 </main><script>
+${FIELD_RULES_SOURCE}
 const form = document.getElementById('idea-form');
 const titleInput = document.getElementById('f-title');
 const descInput = document.getElementById('f-desc');
@@ -52,9 +109,16 @@ const emptyNote = document.getElementById('empty');
 const list = document.getElementById('ideas');
 const EMPTY_TEXT = '还没有意见记录。';
 const LOAD_FAILED_TEXT = '意见列表加载失败，请稍后刷新重试。';
+// 首页侧的问题代码 → 字段错误提示（页面原有措辞，可与接口不同；上限取自同一份字段规则）
+const FIELD_ERROR_TEXT = {
+  'title-empty': '标题不能为空。',
+  'title-too-long': '标题最多 ' + IDEA_FIELD_RULES.title.max + ' 个字符。',
+  'description-empty': '详细说明不能为空。',
+  'description-too-long': '详细说明最多 ' + IDEA_FIELD_RULES.description.max + ' 个字符。',
+  'scenario-too-long': '使用场景最多 ' + IDEA_FIELD_RULES.scenario.max + ' 个字符。',
+};
 // 首次列表请求的状态：loading（进行中）/ ready（成功）/ failed（失败）
 let listState = 'loading';
-function codePoints(text) { return Array.from(text).length; }
 function showError(message) {
   errorBox.textContent = message;
   errorBox.hidden = false;
@@ -148,15 +212,6 @@ let editVersion = 0;
 for (const field of [titleInput, descInput, scenarioInput]) {
   field.addEventListener('input', () => { editVersion += 1; });
 }
-function validate(title, description, scenario) {
-  const trimmed = title.trim();
-  if (!trimmed) return '标题不能为空。';
-  if (codePoints(trimmed) > 120) return '标题最多 120 个字符。';
-  if (!description.trim()) return '详细说明不能为空。';
-  if (codePoints(description) > 5000) return '详细说明最多 5000 个字符。';
-  if (codePoints(scenario) > 1000) return '使用场景最多 1000 个字符。';
-  return null;
-}
 // 每次点击提交都递增：成功或失败提示只属于最近一次点击。
 // 更早发出的请求即使更晚返回，也只能在服务确认保存时更新列表，不能改动当前提示。
 let latestSubmitSeq = 0;
@@ -171,10 +226,11 @@ form.addEventListener('submit', async (event) => {
   const description = descInput.value;
   const scenario = scenarioInput.value;
   const submittedVersion = editVersion;
-  const problem = validate(title, description, scenario);
+  // 发送请求前先按与提交接口相同的字段规则检查；提示措辞是页面自己的
+  const problem = validateIdeaFields(title, description, scenario);
   // 被表单直接拦下的一次点击同样是用户最近的提交操作，字段错误即本次点击的结果；
   // 之后更早请求的返回不能掩盖它
-  if (problem) { showError(problem); return; }
+  if (problem) { showError(FIELD_ERROR_TEXT[problem]); return; }
   let res;
   try {
     res = await fetch('/api/ideas', {
@@ -263,9 +319,6 @@ function respond(res: ServerResponse, status: number, value: unknown, options: {
     'content-length': Buffer.byteLength(body), ...(status === 405 ? { allow: options.allow ?? 'GET' } : {}) });
   res.end(body);
 }
-function codePoints(text: string): number {
-  return Array.from(text).length;
-}
 function readIdeas(): unknown[] {
   const records: unknown = JSON.parse(readFileSync(dataFile, 'utf8'));
   if (!Array.isArray(records)) throw new Error('Invalid record list');
@@ -308,19 +361,15 @@ async function handleCreateIdea(req: IncomingMessage, res: ServerResponse): Prom
     respond(res, 400, { error: '字段 scenario 必须是字符串' });
     return;
   }
-  const title = (body.title as string).trim();
+  // 内容规则（空白处理、码点上限）与首页表单共用同一份字段规则
+  const title = body.title as string;
   const description = body.description as string;
   const scenario = typeof body.scenario === 'string' ? body.scenario : '';
-  if (!title) { respond(res, 400, { error: '标题去掉首尾空白后不能为空' }); return; }
-  if (codePoints(title) > MAX_TITLE) { respond(res, 400, { error: `标题最多 ${MAX_TITLE} 个字符` }); return; }
-  if (!description.trim()) { respond(res, 400, { error: '详细说明必须包含非空白内容' }); return; }
-  if (codePoints(description) > MAX_DESCRIPTION) { respond(res, 400, { error: `详细说明最多 ${MAX_DESCRIPTION} 个字符` }); return; }
-  if (codePoints(scenario) > MAX_SCENARIO) { respond(res, 400, { error: `使用场景最多 ${MAX_SCENARIO} 个字符` }); return; }
+  const problem = fieldRules.validateIdeaFields(title, description, scenario);
+  if (problem !== null) { respond(res, 400, { error: API_FIELD_ERRORS[problem] }); return; }
   const idea = {
     id: randomUUID(),
-    title,
-    description,
-    scenario,
+    ...fieldRules.normalizeIdeaFields(title, description, scenario),
     createdAt: new Date().toISOString(),
   };
   let records: unknown[];
@@ -356,7 +405,7 @@ const server = createServer((req: IncomingMessage, res: ServerResponse): void =>
     } catch { respond(res, 500, { error: 'unable to read ideas' }); }
     return;
   }
-  if (req.method !== 'GET') { respond(res, 405, { error: 'method not allowed' }); return; }
+  if (req.method !== 'GET') { respond(res, 405, { error: 'method not allowed' }, { allow: 'GET' }); return; }
   if (route === '/') { respond(res, 200, PAGE, { html: true }); return; }
   respond(res, 200, { status: 'ok', product: PRODUCT });
 });
