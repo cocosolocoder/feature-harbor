@@ -7,7 +7,9 @@ import {
   FIELD_LIMITS,
   checkIdeaContent,
   normalizeIdea,
+  isCompleteIdea,
   fieldRulesBrowserScript,
+  completeIdeaBrowserScript,
   type ContentErrorCode,
 } from './idea-fields.ts';
 
@@ -55,6 +57,7 @@ time{color:#666;font-size:.9rem}
 <p><a href="/api/ideas">查看意见列表接口</a> · <a href="/health">服务状态</a></p>
 </main><script>
 ${fieldRulesBrowserScript}
+${completeIdeaBrowserScript}
 const form = document.getElementById('idea-form');
 const titleInput = document.getElementById('f-title');
 const descInput = document.getElementById('f-desc');
@@ -125,16 +128,9 @@ function renderList() {
     emptyNote.hidden = true;
   }
 }
-// 一条有效意见必须是 JSON 对象：id 为非空字符串，
+// 完整记录判定（isCompleteIdea）与接口读取已有数据共用同一份实现，
+// 由 idea-fields.ts 注入上方脚本：JSON 对象、id 为非空字符串，
 // title、description、scenario、createdAt 均为字符串（scenario 允许为空字符串）
-function isValidIdea(idea) {
-  if (typeof idea !== 'object' || idea === null || Array.isArray(idea)) return false;
-  if (typeof idea.id !== 'string' || idea.id.length === 0) return false;
-  for (const field of ['title', 'description', 'scenario', 'createdAt']) {
-    if (typeof idea[field] !== 'string') return false;
-  }
-  return true;
-}
 async function loadIdeas() {
   try {
     const res = await fetch('/api/ideas');
@@ -146,7 +142,7 @@ async function loadIdeas() {
     if (typeof data !== 'object' || data === null || Array.isArray(data) || !Array.isArray(data.ideas)) {
       throw new Error('invalid ideas response');
     }
-    if (!data.ideas.every(isValidIdea)) throw new Error('invalid idea record');
+    if (!data.ideas.every(isCompleteIdea)) throw new Error('invalid idea record');
     remoteIdeas = data.ideas;
     listState = 'ready';
   } catch {
@@ -210,10 +206,10 @@ form.addEventListener('submit', async (event) => {
     return;
   }
   // 成功状态的响应同样必须结构完整：顶层是含 idea 的 JSON 对象，
-  // 且 idea 本身通过 isValidIdea 校验（对象、非空 id、各字段均为字符串）。
+  // 且 idea 本身通过 isCompleteIdea 校验（对象、非空 id、各字段均为字符串）。
   // 空对象、数组或缺字段的记录不能当作保存成功：不显示成功提示、
   // 不清空草稿、不并入列表，也不用表单内容补齐响应缺失的信息
-  const saved = typeof data === 'object' && data !== null && !Array.isArray(data) && isValidIdea(data.idea);
+  const saved = typeof data === 'object' && data !== null && !Array.isArray(data) && isCompleteIdea(data.idea);
   if (!saved) {
     if (submitSeq === latestSubmitSeq) showError('提交失败，请稍后重试。');
     return;
@@ -278,25 +274,17 @@ function respond(res: ServerResponse, status: number, value: unknown, options: {
     'content-length': Buffer.byteLength(body), ...(status === 405 ? { allow: options.allow ?? 'GET' } : {}) });
   res.end(body);
 }
-// 一条已有意见必须是 JSON 对象（不能是数组或空值）：id 为非空字符串，
+// 已有记录的结构完整性判定（isCompleteIdea）与首页共用同一份实现，由 idea-fields.ts 提供：
+// JSON 对象（不能是数组或空值）、id 为非空字符串，
 // title、description、scenario、createdAt 均存在且为字符串（scenario 允许为空字符串）。
 // 这里只检查历史记录的结构完整性，不套用新提交的内容限制：
 // 标题首尾空白、正文与场景换行、任意时间字符串都按原样保留，不补字段或改写文字。
-function isStoredIdea(record: unknown): boolean {
-  if (typeof record !== 'object' || record === null || Array.isArray(record)) return false;
-  const idea = record as Record<string, unknown>;
-  if (typeof idea.id !== 'string' || idea.id.length === 0) return false;
-  for (const field of ['title', 'description', 'scenario', 'createdAt'] as const) {
-    if (typeof idea[field] !== 'string') return false;
-  }
-  return true;
-}
 function readIdeas(): unknown[] {
   const records: unknown = JSON.parse(readFileSync(dataFile, 'utf8'));
   if (!Array.isArray(records)) throw new Error('Invalid record list');
   // 任意一条记录结构不符，整份列表都视为读取失败：
   // 不跳过异常记录，也不只返回正常部分。
-  if (!records.every(isStoredIdea)) throw new Error('Invalid idea record');
+  if (!records.every(isCompleteIdea)) throw new Error('Invalid idea record');
   return records;
 }
 function saveIdeas(records: unknown[]): void {

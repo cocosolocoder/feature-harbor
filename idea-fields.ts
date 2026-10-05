@@ -1,5 +1,5 @@
 // 产品意见三个字段的唯一规则来源：首页内联脚本与 POST /api/ideas 接口共用。
-// 上限、空白处理与码点计数只能在这里定义一次：
+// 上限、空白处理与码点计数只能在这里定义一次（完整记录的结构判定 isCompleteIdea 同理）：
 //   - 接口侧（server.ts）直接调用本模块的函数；
 //   - 首页无法使用模块导入，server.ts 把下列同一个函数的源码（Function.prototype.toString）
 //     注入内联脚本，因此页面执行的校验与这里逐字相同，不要在页面里再维护第二份。
@@ -50,6 +50,23 @@ export function checkIdeaContent(
   return null;
 }
 
+// 一条完整意见记录的结构判定，同样是唯一一份：读取已有数据（readIdeas）、
+// 首页加载列表、首页确认提交响应三处共用，不在任何入口另写第二份。
+// 完整记录必须是 JSON 对象（不能是空值或数组）：id 为非空字符串，
+// title、description、scenario、createdAt 均存在且为字符串（scenario 允许为空字符串，
+// 缺少它则不完整；id 不增加格式要求，createdAt 不校验日期有效性）。
+// 这里只判断结构完整性，不套用新提交的内容限制：不去除文字空白、不补齐缺失字段、
+// 不截断内容；记录含有额外字段时仍视为完整，读取时按原样保留。
+export function isCompleteIdea(record: unknown): boolean {
+  if (typeof record !== 'object' || record === null || Array.isArray(record)) return false;
+  const idea = record as Record<string, unknown>;
+  if (typeof idea.id !== 'string' || idea.id.length === 0) return false;
+  for (const field of ['title', 'description', 'scenario', 'createdAt'] as const) {
+    if (typeof idea[field] !== 'string') return false;
+  }
+  return true;
+}
+
 // 校验通过后、保存前的规整：标题去掉首尾空白（内部空白保留），
 // 详细说明与使用场景原样保存。
 export function normalizeIdea(
@@ -66,4 +83,10 @@ export const fieldRulesBrowserScript: string = `// 字段规则与接口共用�
 const FIELD_LIMITS = ${JSON.stringify({ title: FIELD_LIMITS.title, description: FIELD_LIMITS.description, scenario: FIELD_LIMITS.scenario })};
 const codePointCount = ${codePointCount.toString()};
 const checkIdeaContent = ${checkIdeaContent.toString()};
+`;
+
+// 注入首页内联脚本的同一份完整记录判定源码（与字段规则同理，页面不维护第二份）。
+// 首页加载列表与确认提交响应都调用它；接口侧读取已有数据直接调用上面的函数。
+export const completeIdeaBrowserScript: string = `// 完整记录判定与接口共用同一份实现（由 idea-fields.ts 注入，勿在此另写第二份）
+const isCompleteIdea = ${isCompleteIdea.toString()};
 `;
