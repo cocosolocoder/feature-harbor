@@ -60,10 +60,30 @@ export function normalizeIdea(
   return { title: title.trim(), description, scenario };
 }
 
+// 一条完整意见记录的唯一判定，三个入口共用同一份实现：
+//   - 服务读取磁盘上的已有意见（server.ts 的 readIdeas）；
+//   - 首页首次加载意见列表（内联脚本校验 /api/ideas 的每条响应）；
+//   - 首页确认提交结果（内联脚本校验 201 响应里的 idea）。
+// 完整记录必须是对象（不能是空值或数组）：id 为非空字符串，
+// title、description、scenario、createdAt 均存在且为字符串（scenario 允许为空字符串）。
+// 这里只判断结构完整性：id 不检查格式、createdAt 不检查日期有效性；
+// 不重新套用新提交的内容限制（历史标题即使为空白、正文即使超过现在的上限也按原文接受），
+// 不去除文字空白、不补齐缺失字段、不截断内容；记录含额外字段时照样完整，保留这些内容。
+export function isCompleteIdea(record: unknown): boolean {
+  if (typeof record !== 'object' || record === null || Array.isArray(record)) return false;
+  const idea = record as Record<string, unknown>;
+  if (typeof idea.id !== 'string' || idea.id.length === 0) return false;
+  for (const field of ['title', 'description', 'scenario', 'createdAt'] as const) {
+    if (typeof idea[field] !== 'string') return false;
+  }
+  return true;
+}
+
 // 注入首页内联脚本的同一份规则源码。函数直接取自上面的定义（Node 运行 TS 时会剥离类型
 // 标注），页面因此不会出现第二份上限或计数逻辑；提示文案仍由页面侧自己提供。
-export const fieldRulesBrowserScript: string = `// 字段规则与接口共用同一份实现（由 idea-fields.ts 注入，勿在此另写第二份）
+export const fieldRulesBrowserScript: string = `// 字段规则、记录完整性判定与接口共用同一份实现（由 idea-fields.ts 注入，勿在此另写第二份）
 const FIELD_LIMITS = ${JSON.stringify({ title: FIELD_LIMITS.title, description: FIELD_LIMITS.description, scenario: FIELD_LIMITS.scenario })};
 const codePointCount = ${codePointCount.toString()};
 const checkIdeaContent = ${checkIdeaContent.toString()};
+const isCompleteIdea = ${isCompleteIdea.toString()};
 `;
