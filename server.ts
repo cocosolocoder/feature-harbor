@@ -278,9 +278,23 @@ function respond(res: ServerResponse, status: number, value: unknown, options: {
     'content-length': Buffer.byteLength(body), ...(status === 405 ? { allow: options.allow ?? 'GET' } : {}) });
   res.end(body);
 }
+// 已有存储中的每条记录必须与首页 isValidIdea 同一结构：非数组对象，id 为非空字符串，
+// title、description、scenario、createdAt 均为字符串。scenario 允许为空字符串，但不能缺失。
+// 这里只检查历史记录的结构完整性，不套用新提交的内容规则（首尾空白、换行、时间字符串原样保留）。
+function isStoredIdea(record: unknown): boolean {
+  if (typeof record !== 'object' || record === null || Array.isArray(record)) return false;
+  const idea = record as Record<string, unknown>;
+  if (typeof idea.id !== 'string' || idea.id.length === 0) return false;
+  for (const field of ['title', 'description', 'scenario', 'createdAt'] as const) {
+    if (typeof idea[field] !== 'string') return false;
+  }
+  return true;
+}
 function readIdeas(): unknown[] {
   const records: unknown = JSON.parse(readFileSync(dataFile, 'utf8'));
-  if (!Array.isArray(records)) throw new Error('Invalid record list');
+  // 顶层不是数组，或数组中任意一条记录结构不完整，都视为整份列表读取失败：
+  // 不跳过异常记录，也不只返回正常部分。
+  if (!Array.isArray(records) || !records.every(isStoredIdea)) throw new Error('Invalid record list');
   return records;
 }
 function saveIdeas(records: unknown[]): void {
