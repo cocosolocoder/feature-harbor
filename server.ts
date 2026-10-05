@@ -87,13 +87,16 @@ function renderIdea(idea) {
   return item;
 }
 let remoteIdeas = [];
-// 本页已确认保存的意见，最新提交的排在最前
+// 本页已确认保存的意见，按发起提交时的点击次序记录（seq 越大发起越晚）；
+// 渲染时后发起的排在最前，次序只取决于发起先后，与响应到达先后无关
 const submittedIdeas = [];
 function renderList() {
-  // 以服务端标识 id 去重后合并：本页提交成功的意见在前，其后补入首次响应中的其他记录
+  // 以服务端标识 id 去重后合并：本页提交成功的意见按发起次序倒序在前——
+  // 较早发起的请求即使更晚返回，也只补在后提交意见之后，不会把后者挤到第二位；
+  // 其后再补入首次响应中的其他记录
   const seen = new Set();
   const ordered = [];
-  for (const idea of submittedIdeas) {
+  for (const { idea } of [...submittedIdeas].sort((a, b) => b.seq - a.seq)) {
     if (!seen.has(idea.id)) { seen.add(idea.id); ordered.push(idea); }
   }
   for (const idea of remoteIdeas) {
@@ -206,8 +209,10 @@ form.addEventListener('submit', async (event) => {
   // 与响应返回先后无关：过期请求确认保存时也不能清掉用户正在写的草稿
   if (editVersion === submittedVersion) form.reset();
   // 只要服务确认保存，意见就进入列表，即使这条请求已不是最近一次点击：
-  // 不能为了避免提示干扰而丢弃真实保存结果
-  submittedIdeas.unshift(idea);
+  // 不能为了避免提示干扰而丢弃真实保存结果。
+  // 记录的是发起提交时的点击次序，而非响应到达次序：先发起的请求晚到时，
+  // 渲染仍把它排后发起的意见之后，不会因晚返回而插到前面
+  submittedIdeas.push({ seq: submitSeq, idea });
   renderList();
   // 成功提示只属于最近一次点击：更早的请求迟到返回时，不能在最新一次的失败提示
   // 或新一次提交的等待旁边再显示成功

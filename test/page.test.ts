@@ -1135,7 +1135,8 @@ test('两条提交都成功但返回次序颠倒：只显示最近一次的成�
   assert.equal(h.els.error.hidden, true);
   assert.deepEqual(h.titles(), ['后提交']);
 
-  // 较早一次随后成功：不出现失败/重复提示，两条意见都保留，字段逐条对应
+  // 较早一次随后成功：顺序以发起提交的先后为准——后发起的乙仍在第一位，
+  // 晚到的甲补在乙后面，不能因响应晚到而把乙挤到第二位
   h.posts[0].resolve(jsonResponse(201, { idea: firstIdea }));
   await first;
   await flush();
@@ -1144,12 +1145,121 @@ test('两条提交都成功但返回次序颠倒：只显示最近一次的成�
   assert.equal(h.els.error.hidden, true);
   const articles = h.articles();
   assert.equal(articles.length, 2);
-  assertArticleMatches(articles.find((a) => a.children.some((n) => n.tagName === 'H3' && n.textContent === '先提交'))!, firstIdea);
-  assertArticleMatches(articles.find((a) => a.children.some((n) => n.tagName === 'H3' && n.textContent === '后提交'))!, secondIdea);
+  // 位置次序与记录内容逐条对应：不能为调整位置交换两条记录的标题、正文或时间
+  assert.deepEqual(h.titles(), ['后提交', '先提交']);
+  assertArticleMatches(articles[0], secondIdea);
+  assertArticleMatches(articles[1], firstIdea);
   // 第二次点击之后没有再编辑：最近一次成功按草稿保护规则清空表单（与响应先后无关）
   assert.equal(h.els['f-title'].value, '');
   assert.equal(h.els['f-desc'].value, '');
   assert.equal(h.els['f-scenario'].value, '');
+});
+
+test('两条提交都成功且按发起次序返回：最终顺序与返回次序颠倒时相同（后发起的在前）', async () => {
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: [] }));
+  await flush();
+
+  const firstIdea = makeIdea({ id: 'a', title: '先提交', description: '先提交的说明', scenario: '先提交的场景', createdAt: '2026-03-01T00:00:00.000Z' });
+  const secondIdea = makeIdea({ id: 'b', title: '后提交', description: '后提交的说明', scenario: '', createdAt: '2026-03-02T00:00:00.000Z' });
+  h.setForm({ title: '先提交', description: '先提交的说明', scenario: '先提交的场景' });
+  const first = h.submit();
+  h.edit('f-title', '后提交');
+  h.edit('f-desc', '后提交的说明');
+  h.edit('f-scenario', '');
+  const second = h.submit();
+
+  // 先发起的先返回、后发起的后返回
+  h.posts[0].resolve(jsonResponse(201, { idea: firstIdea }));
+  await first;
+  await flush();
+  assert.deepEqual(h.titles(), ['先提交']);
+  h.posts[1].resolve(jsonResponse(201, { idea: secondIdea }));
+  await second;
+  await flush();
+  const articles = h.articles();
+  assert.equal(articles.length, 2);
+  assert.deepEqual(h.titles(), ['后提交', '先提交']);
+  assertArticleMatches(articles[0], secondIdea);
+  assertArticleMatches(articles[1], firstIdea);
+});
+
+test('两条提交的 createdAt 相同但返回次序颠倒：仍按本页发起先后排列，不按提交时间排序', async () => {
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: [] }));
+  await flush();
+
+  const sameTime = '2026-03-01T00:00:00.000Z';
+  const firstIdea = makeIdea({ id: 'a', title: '先提交', description: '先提交的说明', createdAt: sameTime });
+  const secondIdea = makeIdea({ id: 'b', title: '后提交', description: '后提交的说明', createdAt: sameTime });
+  h.setForm({ title: '先提交', description: '先提交的说明' });
+  const first = h.submit();
+  h.edit('f-title', '后提交');
+  h.edit('f-desc', '后提交的说明');
+  const second = h.submit();
+
+  h.posts[1].resolve(jsonResponse(201, { idea: secondIdea }));
+  await second;
+  await flush();
+  h.posts[0].resolve(jsonResponse(201, { idea: firstIdea }));
+  await first;
+  await flush();
+  assert.deepEqual(h.titles(), ['后提交', '先提交']);
+  assert.equal(h.articles()[1].children.find((n) => n.tagName === 'TIME')!.dateTime, sameTime);
+});
+
+test('返回次序颠倒且较早一次失败：失败不产生占位意见、不移动已保存意见，后提交的成功仍正常展示', async () => {
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: [] }));
+  await flush();
+
+  const secondIdea = makeIdea({ id: 'b', title: '后提交', description: '后提交的说明' });
+  h.setForm({ title: '先提交', description: '先提交的说明' });
+  const first = h.submit();
+  h.edit('f-title', '后提交');
+  h.edit('f-desc', '后提交的说明');
+  const second = h.submit();
+
+  // 后发起的先成功
+  h.posts[1].resolve(jsonResponse(201, { idea: secondIdea }));
+  await second;
+  await flush();
+  assert.deepEqual(h.titles(), ['后提交']);
+  // 先发起的随后被服务拒绝：列表不增加占位、后提交的意见仍在原位
+  h.posts[0].resolve(jsonResponse(400, { error: '先提交被拒绝' }));
+  await first;
+  await flush();
+  assert.deepEqual(h.titles(), ['后提交']);
+});
+
+test('首次列表尚未返回时连续提交两条且响应颠倒：后发起的在前；列表随后到达不覆盖、不改变相对位置', async () => {
+  const h = new Harness(pageScript);
+  const remote1 = makeIdea({ id: 'r1', title: '已有一' });
+  const remote2 = makeIdea({ id: 'r2', title: '已有二' });
+
+  const firstIdea = makeIdea({ id: 'a', title: '先提交', description: '先提交的说明' });
+  const secondIdea = makeIdea({ id: 'b', title: '后提交', description: '后提交的说明' });
+  h.setForm({ title: '先提交', description: '先提交的说明' });
+  const first = h.submit();
+  h.edit('f-title', '后提交');
+  h.edit('f-desc', '后提交的说明');
+  const second = h.submit();
+
+  h.posts[1].resolve(jsonResponse(201, { idea: secondIdea }));
+  await second;
+  await flush();
+  h.posts[0].resolve(jsonResponse(201, { idea: firstIdea }));
+  await first;
+  await flush();
+  assert.deepEqual(h.titles(), ['后提交', '先提交']);
+
+  // 首次列表晚到：包含先提交的同一条（同 id）时只显示一条并采用提交响应的内容，
+  // 本页意见的相对位置不变，已有记录保持接口次序补在后面
+  const listCopyOfFirst = { ...firstIdea, title: '不应覆盖的标题' };
+  h.gets[0].resolve(jsonResponse(200, { ideas: [listCopyOfFirst, remote1, remote2] }));
+  await flush();
+  assert.deepEqual(h.titles(), ['后提交', '先提交', '已有一', '已有二']);
+  assertArticleMatches(h.articles()[1], firstIdea);
 });
 
 // 字符上限的首页表单回归。与 test/length-limits.test.ts 的接口用例使用同一批边界内容，
