@@ -155,8 +155,14 @@ function validate(title, description, scenario) {
   if (codePoints(scenario) > 1000) return '使用场景最多 1000 个字符。';
   return null;
 }
+// 每次点击提交都递增：成功或失败提示只属于最近一次点击。
+// 更早发出的请求即使更晚返回，也只能在服务确认保存时更新列表，不能改动当前提示。
+let latestSubmitSeq = 0;
 form.addEventListener('submit', async (event) => {
   event.preventDefault();
+  const submitSeq = ++latestSubmitSeq;
+  // 用户发起新的提交后，上一条操作的提示先清除；在本次点击有结果前，
+  // 更早请求迟到返回也不能重新显示成功或失败，也不能让人误以为正在提交的意见已保存
   errorBox.hidden = true;
   successBox.hidden = true;
   const title = titleInput.value;
@@ -164,6 +170,8 @@ form.addEventListener('submit', async (event) => {
   const scenario = scenarioInput.value;
   const submittedVersion = editVersion;
   const problem = validate(title, description, scenario);
+  // 被表单直接拦下的一次点击同样是用户最近的提交操作，字段错误即本次点击的结果；
+  // 之后更早请求的返回不能掩盖它
   if (problem) { showError(problem); return; }
   let res;
   try {
@@ -173,31 +181,40 @@ form.addEventListener('submit', async (event) => {
       body: JSON.stringify({ title, description, scenario })
     });
   } catch {
-    showError('网络错误，提交未成功，请重试。');
+    if (submitSeq === latestSubmitSeq) showError('网络错误，提交未成功，请重试。');
     return;
   }
   let data = null;
   try { data = await res.json(); } catch { data = null; }
   if (!res.ok) {
-    showError(data && data.error ? '提交失败：' + data.error : '提交失败，请稍后重试。');
+    if (submitSeq === latestSubmitSeq) {
+      showError(data && data.error ? '提交失败：' + data.error : '提交失败，请稍后重试。');
+    }
     return;
   }
   // 成功状态的响应同样必须结构完整：顶层是含 idea 的 JSON 对象，
   // 且 idea 本身通过 isValidIdea 校验（对象、非空 id、各字段均为字符串）。
   // 空对象、数组或缺字段的记录不能当作保存成功：不显示成功提示、
   // 不清空草稿、不并入列表，也不用表单内容补齐响应缺失的信息
-  if (typeof data !== 'object' || data === null || Array.isArray(data) || !isValidIdea(data.idea)) {
-    showError('提交失败，请稍后重试。');
+  const saved = typeof data === 'object' && data !== null && !Array.isArray(data) && isValidIdea(data.idea);
+  if (!saved) {
+    if (submitSeq === latestSubmitSeq) showError('提交失败，请稍后重试。');
     return;
   }
-  // 只有等待期间没有继续编辑（包括改回原文、清空字段也算编辑）才清空表单；
-  // 否则完整保留此刻的草稿，成功提示与列表仍按本次提交的记录更新
+  const idea = data.idea;
+  // 是否清空表单只取决于等待期间有没有继续编辑（包括改回原文、清空字段也算编辑），
+  // 与响应返回先后无关：过期请求确认保存时也不能清掉用户正在写的草稿
   if (editVersion === submittedVersion) form.reset();
-  successBox.textContent = '提交成功，你的意见已保存。';
-  successBox.hidden = false;
-  // 只把已确认保存的意见并入列表，随后统一渲染，避免与首次列表响应相互覆盖
-  submittedIdeas.unshift(data.idea);
+  // 只要服务确认保存，意见就进入列表，即使这条请求已不是最近一次点击：
+  // 不能为了避免提示干扰而丢弃真实保存结果
+  submittedIdeas.unshift(idea);
   renderList();
+  // 成功提示只属于最近一次点击：更早的请求迟到返回时，不能在最新一次的失败提示
+  // 或新一次提交的等待旁边再显示成功
+  if (submitSeq === latestSubmitSeq) {
+    successBox.textContent = '提交成功，你的意见已保存。';
+    successBox.hidden = false;
+  }
 });
 loadIdeas();
 </script></html>`;

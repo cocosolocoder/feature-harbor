@@ -844,6 +844,314 @@ test('两条提交在途且期间未编辑：先返回的成功清空表单，�
   assert.deepEqual(h.titles(), ['同文意见', '同文意见']);
 });
 
+// 提交提示归属：成功或失败提示只属于最近一次点击提交。用户可以在上一条请求还没返回时
+// 再次点击提交，更早请求迟到的任何结果都不能改动当前提示；但旧请求被服务确认保存的意见
+// 仍必须进入列表。下列用例精确控制两个 POST 的返回先后与结果类型。
+
+function settleGate(g: Gate, outcome: 'network-error' | 'server-reject' | 'broken-json' | 'missing-idea'): void {
+  if (outcome === 'network-error') {
+    g.reject(new TypeError('Failed to fetch'));
+  } else if (outcome === 'server-reject') {
+    g.resolve(jsonResponse(400, { error: '较早一次提交被拒绝' }));
+  } else if (outcome === 'broken-json') {
+    g.resolve(brokenJsonResponse(201));
+  } else {
+    g.resolve(jsonResponse(201, { saved: true }));
+  }
+}
+
+const STALE_FAILURE_KINDS = [
+  { name: '网络错误', outcome: 'network-error' as const },
+  { name: '服务拒绝（400）', outcome: 'server-reject' as const },
+  { name: '201 但响应无法解析', outcome: 'broken-json' as const },
+  { name: '201 但内容不完整（缺 idea）', outcome: 'missing-idea' as const },
+];
+
+test('后一次提交先确认保存后，较早请求迟到的各类失败都不能把成功提示改成失败', async (t) => {
+  for (const c of STALE_FAILURE_KINDS) {
+    await t.test(c.name, async () => {
+      const h = new Harness(pageScript);
+      h.gets[0].resolve(jsonResponse(200, { ideas: [] }));
+      await flush();
+
+      h.setForm({ title: '先提交', description: '先提交的说明' });
+      const first = h.submit();
+      h.setForm({ title: '后提交', description: '后提交的说明' });
+      const second = h.submit();
+      assert.equal(h.posts.length, 2);
+
+      // 后一次点击先确认保存：成功提示属于它
+      h.posts[1].resolve(jsonResponse(201, { idea: makeIdea({ id: 'b', title: '后提交', description: '后提交的说明' }) }));
+      await second;
+      await flush();
+      assert.equal(h.els.success.hidden, false);
+      assert.equal(h.els.success.textContent, SUCCESS_TEXT);
+      assert.equal(h.els.error.hidden, true);
+      assert.deepEqual(h.titles(), ['后提交']);
+
+      // 较早请求随后才失败：成功提示必须原样保留，不出现失败，失败的意见不入列表
+      settleGate(h.posts[0], c.outcome);
+      await first;
+      await flush();
+      assert.equal(h.els.success.hidden, false, c.name);
+      assert.equal(h.els.success.textContent, SUCCESS_TEXT, c.name);
+      assert.equal(h.els.error.hidden, true, c.name);
+      assert.deepEqual(h.titles(), ['后提交'], c.name);
+    });
+  }
+});
+
+test('后一次提交先被服务拒绝、较早请求随后才确认保存：保留后一次失败说明，不另显示成功，先提交的意见仍带着自己的字段进入列表', async () => {
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: [] }));
+  await flush();
+
+  const firstIdea = makeIdea({
+    id: 'a',
+    title: '先提交',
+    description: '先提交的说明',
+    scenario: '先提交的场景',
+    createdAt: '2026-03-01T00:00:00.000Z',
+  });
+  h.setForm({ title: '先提交', description: '先提交的说明', scenario: '先提交的场景' });
+  const first = h.submit();
+  // 用 edit 布置第二条（触发 input 事件），模拟等待期间继续编辑后再次提交
+  h.edit('f-title', '后提交');
+  h.edit('f-desc', '后提交的说明');
+  const second = h.submit();
+  assert.equal(h.posts.length, 2);
+
+  // 后一次点击先被拒绝：失败提示属于它
+  h.posts[1].resolve(jsonResponse(400, { error: '后提交被拒绝' }));
+  await second;
+  await flush();
+  assert.equal(h.els.error.hidden, false);
+  assert.equal(h.els.error.textContent, '提交失败：后提交被拒绝');
+  assert.equal(h.els.success.hidden, true);
+  assert.equal(h.articles().length, 0);
+
+  // 先提交随后才确认保存：失败提示原样保留、成功提示不出现；意见仍入列表，
+  // 标题、详细说明、使用场景、时间逐条对应
+  h.posts[0].resolve(jsonResponse(201, { idea: firstIdea }));
+  await first;
+  await flush();
+  assert.equal(h.els.error.hidden, false);
+  assert.equal(h.els.error.textContent, '提交失败：后提交被拒绝');
+  assert.equal(h.els.success.hidden, true);
+  const articles = h.articles();
+  assert.equal(articles.length, 1);
+  assertArticleMatches(articles[0], firstIdea);
+  // 等待期间有编辑：迟到的成功受草稿保护，不能清掉当前输入
+  assert.equal(h.els['f-title'].value, '后提交');
+  assert.equal(h.els['f-desc'].value, '后提交的说明');
+});
+
+test('最近一次提交仍在等待时，较早请求确认保存不显示成功提示，但其意见进入列表；最近一次返回后只显示它自己的成功', async () => {
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: [] }));
+  await flush();
+
+  h.setForm({ title: '先提交', description: '先提交的说明' });
+  const first = h.submit();
+  h.setForm({ title: '后提交', description: '后提交的说明' });
+  const second = h.submit();
+  assert.equal(h.posts.length, 2);
+
+  // 较早请求先返回成功，但最近一次点击仍在等待：不能显示成功，
+  // 以免让人误以为正在提交的第二条也已保存；已保存的第一条仍要出现在列表里
+  h.posts[0].resolve(jsonResponse(201, { idea: makeIdea({ id: 'a', title: '先提交', description: '先提交的说明' }) }));
+  await first;
+  await flush();
+  assert.equal(h.els.success.hidden, true);
+  assert.equal(h.els.error.hidden, true);
+  assert.deepEqual(h.titles(), ['先提交']);
+
+  // 最近一次点击有了结果：只显示它的成功提示，两条意见都在
+  h.posts[1].resolve(jsonResponse(201, { idea: makeIdea({ id: 'b', title: '后提交', description: '后提交的说明' }) }));
+  await second;
+  await flush();
+  assert.equal(h.els.success.hidden, false);
+  assert.equal(h.els.success.textContent, SUCCESS_TEXT);
+  assert.equal(h.els.error.hidden, true);
+  assert.deepEqual(h.titles(), ['后提交', '先提交']);
+});
+
+test('最近一次提交等待中较早请求失败不显示失败；最近一次被拒时显示的是它自己的失败说明', async () => {
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: [] }));
+  await flush();
+
+  h.setForm({ title: '先提交', description: '先提交的说明' });
+  const first = h.submit();
+  h.setForm({ title: '后提交', description: '后提交的说明' });
+  const second = h.submit();
+
+  // 较早请求先网络失败，但最近一次点击仍在等待：不显示任何失败
+  h.posts[0].reject(new TypeError('Failed to fetch'));
+  await first;
+  await flush();
+  assert.equal(h.els.error.hidden, true);
+  assert.equal(h.els.success.hidden, true);
+  assert.equal(h.articles().length, 0);
+
+  // 最近一次点击被服务拒绝：显示的必须是它自己的失败说明
+  h.posts[1].resolve(jsonResponse(400, { error: '第二次提交的问题' }));
+  await second;
+  await flush();
+  assert.equal(h.els.error.hidden, false);
+  assert.equal(h.els.error.textContent, '提交失败：第二次提交的问题');
+  assert.equal(h.els.success.hidden, true);
+});
+
+test('最近一次点击被表单校验直接拦下时保留字段错误；较早请求之后成功或失败都不能掩盖它', async (t) => {
+  await t.test('较早请求迟到确认保存：字段错误保留、不显示成功，保存的意见仍入列表且草稿不清空', async () => {
+    const h = new Harness(pageScript);
+    h.gets[0].resolve(jsonResponse(200, { ideas: [] }));
+    await flush();
+
+    h.setForm({ title: '先提交标题', description: '先提交说明' });
+    const first = h.submit();
+    assert.equal(h.postsIssued, 1);
+
+    // 把标题改成空白后再次点击：请求都不会发出，字段错误就是最近一次提交操作的结果
+    h.edit('f-title', '   ');
+    await h.submit();
+    assert.equal(h.postsIssued, 1);
+    assert.equal(h.els.error.hidden, false);
+    assert.equal(h.els.error.textContent, '标题不能为空。');
+    assert.equal(h.els.success.hidden, true);
+
+    // 较早请求随后确认保存：字段错误原样保留、成功不出现，意见仍入列表
+    h.posts[0].resolve(jsonResponse(201, { idea: makeIdea({ id: 'a', title: '先提交标题', description: '先提交说明' }) }));
+    await first;
+    await flush();
+    assert.equal(h.els.error.hidden, false);
+    assert.equal(h.els.error.textContent, '标题不能为空。');
+    assert.equal(h.els.success.hidden, true);
+    assert.deepEqual(h.titles(), ['先提交标题']);
+    // 点击后有编辑，迟到成功受草稿保护，空白标题与其他输入保留
+    assert.equal(h.els['f-title'].value, '   ');
+    assert.equal(h.els['f-desc'].value, '先提交说明');
+  });
+
+  for (const c of STALE_FAILURE_KINDS) {
+    await t.test(`较早请求迟到失败（${c.name}）：字段错误不被网络/服务失败覆盖`, async () => {
+      const h = new Harness(pageScript);
+      h.gets[0].resolve(jsonResponse(200, { ideas: [] }));
+      await flush();
+
+      h.setForm({ title: '先提交标题', description: '先提交说明' });
+      const first = h.submit();
+      h.edit('f-title', '   ');
+      await h.submit();
+      assert.equal(h.els.error.textContent, '标题不能为空。');
+
+      settleGate(h.posts[0], c.outcome);
+      await first;
+      await flush();
+
+      assert.equal(h.els.error.hidden, false, c.name);
+      assert.equal(h.els.error.textContent, '标题不能为空。', c.name);
+      assert.equal(h.els.success.hidden, true, c.name);
+      assert.equal(h.articles().length, 0, c.name);
+      assert.equal(h.els['f-title'].value, '   ', c.name);
+    });
+  }
+});
+
+test('发起新的提交后先清除上一条操作的提示：本次结果返回前不显示成功或失败', async (t) => {
+  await t.test('上一条成功：再次点击提交后成功提示立即消失', async () => {
+    const h = new Harness(pageScript);
+    h.gets[0].resolve(jsonResponse(200, { ideas: [] }));
+    await flush();
+
+    h.setForm({ title: '第一条', description: '第一条说明' });
+    const first = h.submit();
+    h.posts[0].resolve(jsonResponse(201, { idea: makeIdea({ id: 'a', title: '第一条' }) }));
+    await first;
+    await flush();
+    assert.equal(h.els.success.hidden, false);
+
+    h.edit('f-title', '第二条');
+    h.edit('f-desc', '第二条说明');
+    const second = h.submit();
+    assert.equal(h.posts.length, 2);
+    // 新点击已发起、结果未返回：上一条成功提示先被清除，且没有失败提示
+    assert.equal(h.els.success.hidden, true);
+    assert.equal(h.els.error.hidden, true);
+
+    h.posts[1].resolve(jsonResponse(201, { idea: makeIdea({ id: 'b', title: '第二条' }) }));
+    await second;
+    await flush();
+    assert.equal(h.els.success.hidden, false);
+    assert.equal(h.els.success.textContent, SUCCESS_TEXT);
+  });
+
+  await t.test('上一条失败：再次点击提交后失败提示立即消失', async () => {
+    const h = new Harness(pageScript);
+    h.gets[0].resolve(jsonResponse(200, { ideas: [] }));
+    await flush();
+
+    h.setForm({ title: '第一条', description: '第一条说明' });
+    const first = h.submit();
+    h.posts[0].reject(new TypeError('Failed to fetch'));
+    await first;
+    await flush();
+    assert.equal(h.els.error.hidden, false);
+
+    h.edit('f-title', '第二条');
+    const second = h.submit();
+    assert.equal(h.posts.length, 2);
+    assert.equal(h.els.error.hidden, true);
+    assert.equal(h.els.success.hidden, true);
+
+    h.posts[1].resolve(jsonResponse(201, { idea: makeIdea({ id: 'b', title: '第二条' }) }));
+    await second;
+    await flush();
+    assert.equal(h.els.success.hidden, false);
+    assert.equal(h.els.error.hidden, true);
+  });
+});
+
+test('两条提交都成功但返回次序颠倒：只显示最近一次的成功提示，不出现失败，两条意见分别保留且各自字段对应', async () => {
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: [] }));
+  await flush();
+
+  const firstIdea = makeIdea({ id: 'a', title: '先提交', description: '先提交的说明', scenario: '先提交的场景', createdAt: '2026-03-01T00:00:00.000Z' });
+  const secondIdea = makeIdea({ id: 'b', title: '后提交', description: '后提交的说明', scenario: '', createdAt: '2026-03-02T00:00:00.000Z' });
+  h.setForm({ title: '先提交', description: '先提交的说明', scenario: '先提交的场景' });
+  const first = h.submit();
+  h.edit('f-title', '后提交');
+  h.edit('f-desc', '后提交的说明');
+  h.edit('f-scenario', '');
+  const second = h.submit();
+
+  // 后一次先返回成功
+  h.posts[1].resolve(jsonResponse(201, { idea: secondIdea }));
+  await second;
+  await flush();
+  assert.equal(h.els.success.hidden, false);
+  assert.equal(h.els.error.hidden, true);
+  assert.deepEqual(h.titles(), ['后提交']);
+
+  // 较早一次随后成功：不出现失败/重复提示，两条意见都保留，字段逐条对应
+  h.posts[0].resolve(jsonResponse(201, { idea: firstIdea }));
+  await first;
+  await flush();
+  assert.equal(h.els.success.hidden, false);
+  assert.equal(h.els.success.textContent, SUCCESS_TEXT);
+  assert.equal(h.els.error.hidden, true);
+  const articles = h.articles();
+  assert.equal(articles.length, 2);
+  assertArticleMatches(articles.find((a) => a.children.some((n) => n.tagName === 'H3' && n.textContent === '先提交'))!, firstIdea);
+  assertArticleMatches(articles.find((a) => a.children.some((n) => n.tagName === 'H3' && n.textContent === '后提交'))!, secondIdea);
+  // 第二次点击之后没有再编辑：最近一次成功按草稿保护规则清空表单（与响应先后无关）
+  assert.equal(h.els['f-title'].value, '');
+  assert.equal(h.els['f-desc'].value, '');
+  assert.equal(h.els['f-scenario'].value, '');
+});
+
 // 字符上限的首页表单回归。与 test/length-limits.test.ts 的接口用例使用同一批边界内容，
 // 保证「首页表单」与「直接提交接口」两个入口对中文、表情、换行与首尾空白的接受/拒绝一致。
 // 长度按 Unicode 码点计（标题 120、详细说明 5000、使用场景 1000）；
