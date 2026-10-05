@@ -1152,6 +1152,117 @@ test('两条提交都成功但返回次序颠倒：只显示最近一次的成�
   assert.equal(h.els['f-scenario'].value, '');
 });
 
+test('两条提交返回次序颠倒：后提交的乙始终排在前，先提交的甲迟到确认后补入乙后面', async () => {
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: [] }));
+  await flush();
+
+  // 两条记录提交时间相同：排列只按本页发起提交的先后，与时间无关
+  const sameTime = '2026-03-01T00:00:00.000Z';
+  const ideaA = makeIdea({ id: 'a', title: '甲', description: '甲的说明', scenario: '甲的场景', createdAt: sameTime });
+  const ideaB = makeIdea({ id: 'b', title: '乙', description: '乙的说明', scenario: '', createdAt: sameTime });
+  h.setForm({ title: '甲', description: '甲的说明', scenario: '甲的场景' });
+  const first = h.submit();
+  h.setForm({ title: '乙', description: '乙的说明' });
+  const second = h.submit();
+  assert.equal(h.posts.length, 2);
+
+  // 乙先返回成功：先显示乙
+  h.posts[1].resolve(jsonResponse(201, { idea: ideaB }));
+  await second;
+  await flush();
+  assert.deepEqual(h.titles(), ['乙']);
+
+  // 甲随后才返回成功：补入乙后面，不能把乙挤到第二位
+  h.posts[0].resolve(jsonResponse(201, { idea: ideaA }));
+  await first;
+  await flush();
+  assert.deepEqual(h.titles(), ['乙', '甲']);
+  const articles = h.articles();
+  assert.equal(articles.length, 2);
+  assertArticleMatches(articles[0], ideaB);
+  assertArticleMatches(articles[1], ideaA);
+});
+
+test('两条提交按发起次序返回：最终顺序同样是后提交的在前', async () => {
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: [] }));
+  await flush();
+
+  const ideaA = makeIdea({ id: 'a', title: '甲', description: '甲的说明' });
+  const ideaB = makeIdea({ id: 'b', title: '乙', description: '乙的说明' });
+  h.setForm({ title: '甲', description: '甲的说明' });
+  const first = h.submit();
+  h.setForm({ title: '乙', description: '乙的说明' });
+  const second = h.submit();
+
+  h.posts[0].resolve(jsonResponse(201, { idea: ideaA }));
+  await first;
+  await flush();
+  assert.deepEqual(h.titles(), ['甲']);
+
+  h.posts[1].resolve(jsonResponse(201, { idea: ideaB }));
+  await second;
+  await flush();
+  assert.deepEqual(h.titles(), ['乙', '甲']);
+});
+
+test('首次列表未返回时连续提交且返回次序颠倒：按提交先后排列，晚到的列表不覆盖也不重排', async () => {
+  const h = new Harness(pageScript);
+
+  const ideaA = makeIdea({ id: 'a', title: '甲', description: '甲的说明' });
+  const ideaB = makeIdea({ id: 'b', title: '乙', description: '乙的说明' });
+  h.setForm({ title: '甲', description: '甲的说明' });
+  const first = h.submit();
+  h.setForm({ title: '乙', description: '乙的说明' });
+  const second = h.submit();
+
+  // 首次列表仍在加载，乙先确认、甲随后确认
+  h.posts[1].resolve(jsonResponse(201, { idea: ideaB }));
+  await second;
+  await flush();
+  h.posts[0].resolve(jsonResponse(201, { idea: ideaA }));
+  await first;
+  await flush();
+  assert.deepEqual(h.titles(), ['乙', '甲']);
+
+  // 首次列表随后到达（含乙的重复拷贝与一条已有意见）：
+  // 已保存意见不被覆盖、相对位置不变，已有记录按接口次序补在后面
+  const remote = makeIdea({ id: 'r1', title: '已有意见' });
+  const staleCopy = makeIdea({ id: 'b', title: '列表里的乙' });
+  h.gets[0].resolve(jsonResponse(200, { ideas: [staleCopy, remote] }));
+  await flush();
+  assert.deepEqual(h.titles(), ['乙', '甲', '已有意见']);
+  const articles = h.articles();
+  assertArticleMatches(articles[0], ideaB);
+  assertArticleMatches(articles[1], ideaA);
+  assertArticleMatches(articles[2], remote);
+});
+
+test('先提交的甲失败、后提交的乙成功：乙正常展示且位置不受相邻失败影响', async () => {
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: [] }));
+  await flush();
+
+  h.setForm({ title: '甲', description: '甲的说明' });
+  const first = h.submit();
+  h.setForm({ title: '乙', description: '乙的说明' });
+  const second = h.submit();
+
+  // 乙先确认保存
+  h.posts[1].resolve(jsonResponse(201, { idea: makeIdea({ id: 'b', title: '乙' }) }));
+  await second;
+  await flush();
+  assert.deepEqual(h.titles(), ['乙']);
+
+  // 甲随后被服务拒绝：不出现占位意见，乙的位置不变
+  h.posts[0].resolve(jsonResponse(400, { error: '甲被拒绝' }));
+  await first;
+  await flush();
+  assert.deepEqual(h.titles(), ['乙']);
+  assert.equal(h.articles().length, 1);
+});
+
 // 字符上限的首页表单回归。与 test/length-limits.test.ts 的接口用例使用同一批边界内容，
 // 保证「首页表单」与「直接提交接口」两个入口对中文、表情、换行与首尾空白的接受/拒绝一致。
 // 长度按 Unicode 码点计（标题 120、详细说明 5000、使用场景 1000）；
