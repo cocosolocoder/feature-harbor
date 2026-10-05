@@ -36,6 +36,8 @@ interface El {
   children: El[];
   text: string | null;
   textContent: string;
+  // 警戒标记：页面一旦通过 innerHTML 渲染内容即为 true（纯文本展示不允许走 innerHTML）
+  innerHTMLAssigned: boolean;
   listeners: Record<string, Array<(event: unknown) => unknown>>;
   append(...nodes: El[]): void;
   replaceChildren(...nodes: El[]): void;
@@ -52,6 +54,7 @@ function makeElement(tag: string): El {
     dateTime: '',
     children: [],
     text: null as string | null,
+    innerHTMLAssigned: false,
     listeners: {} as Record<string, Array<(event: unknown) => unknown>>,
     append(...nodes: El[]): void {
       this.children.push(...nodes);
@@ -70,6 +73,16 @@ function makeElement(tag: string): El {
     },
     set(this: any, value: unknown): void {
       this.text = String(value);
+    },
+  });
+  // innerHTML 只记录不解析：意见内容若改走 innerHTML 渲染，textContent 断言会失败，
+  // innerHTMLAssigned 标记则给出更直接的原因
+  Object.defineProperty(node, 'innerHTML', {
+    get(): string {
+      return '';
+    },
+    set(this: any, value: unknown): void {
+      this.innerHTMLAssigned = true;
     },
   });
   return node as El;
@@ -132,6 +145,9 @@ const SUBMIT_FAILED_TEXT = '提交失败，请稍后重试。';
 
 class Harness {
   els: Record<string, El> = {};
+  // 页面脚本通过 document.createElement 创建过的全部元素（按创建先后），
+  // 用于断言渲染只产生纯文本结构，不为意见内容创建脚本、图片、链接、表单等元素
+  created: El[] = [];
   gets: Gate[] = [];
   getsIssued = 0;
   posts: Gate[] = [];
@@ -162,7 +178,11 @@ class Harness {
     };
     const documentMock = {
       getElementById: (id: string): El => byId.get(id)!,
-      createElement: (tag: string): El => makeElement(tag),
+      createElement: (tag: string): El => {
+        const el = makeElement(tag);
+        this.created.push(el);
+        return el;
+      },
     };
     const fetchMock = (url: unknown, init?: { method?: string; body?: unknown }): Promise<unknown> => {
       const method = init?.method ?? 'GET';
@@ -1763,4 +1783,216 @@ test('超限被拦后把字段缩短到允许范围：可以正常提交，之�
     assert.equal(h.els.error.hidden, true);
     assertArticleMatches(h.articles()[0], makeIdea({ id: 'b', title: '标题', description: fixed }));
   });
+});
+
+// 纯文本展示回归：用户会在标题、详细说明、使用场景中粘贴网页片段、代码示例或报错内容。
+// 这些文字（含看起来像网页标记的片段、脚本与事件属性、原文已有的 &lt; &amp; 等实体写法、
+// 引号与尖括号）必须逐字按普通文字展示：不能被当成网页结构解析（不生成元素、不执行动作、
+// 不触发额外请求），不能为避免解析而删改原文符号或整段内容，不能把实体解码成别的字符，
+// 也不能再叠加一层转义。覆盖两种展示过程：打开首页加载已有意见、提交成功后新意见直接进入
+// 列表；展示内容一律以接口实际返回的记录为准。这些用例要能发现：改用 innerHTML 渲染、
+// 按标记解析文本、剥离尖括号内容、解码或重复转义实体、特殊文字串到相邻记录。
+
+// 三个字段都带网页标记样文本；详细说明与使用场景同时含中文、表情、空行与首尾空白
+const MARKUP_TITLE = '建议 <b>重点</b> 支持 "深色" 模式 😀';
+const MARKUP_DESCRIPTION = [
+  '  报错内容原样保留首尾空白  ',
+  '',
+  '代码片段 <script>alert("x")</script> 与图片样文本 <img src=x onerror="alert(1)">',
+  '链接样文本 <a href="https://example.com">示例</a>、表单样文本 <form><input name="q"></form>',
+  '实体原文 &lt;div&gt;、&amp;、&quot;引号&quot; 与 "双引号"、<尖括号> 😀',
+  '  末行空白也保留  ',
+].join('\n');
+const MARKUP_SCENARIO = '  场景 <b>加粗</b> &lt;标签&gt; "引号" 😀\n\n含空行  ';
+
+// 以实体写法为主的记录：&lt;、&amp;、引号必须保持字面内容，不解码也不再转义
+const ENTITY_TITLE = '实体 &lt;b&gt; 与 &amp; 保持原文';
+const ENTITY_DESCRIPTION = '已有写法 &lt;p&gt;段落&lt;/p&gt;、&amp;、&quot; 与 "引号" 逐字保留\n第二行 &lt;div&gt; 😀';
+const ENTITY_SCENARIO = '&lt;场景&gt; &amp; "引号"';
+
+// 渲染意见只应产生的元素；意见文字里的脚本、图片、链接、表单、加粗等标记
+// 一旦被当成网页结构，就会多出此集合之外的元素
+const RENDER_TAGS = new Set(['ARTICLE', 'H3', 'P', 'STRONG', 'SPAN', 'TIME']);
+
+// 断言整个渲染过程只产生纯文本结构：不创建意见文字里出现的元素、不经过 innerHTML、
+// 列表里只有意见记录本身（没有额外插入的表单或记录）
+function assertPlainTextOnly(h: Harness): void {
+  for (const el of h.created) {
+    assert.ok(RENDER_TAGS.has(el.tagName), `不应为意见内容创建 ${el.tagName} 元素`);
+    assert.equal(el.innerHTMLAssigned, false, '不应通过 innerHTML 渲染意见内容');
+  }
+  for (const child of h.els.ideas.children) {
+    assert.equal(child.tagName, 'ARTICLE', '列表中不应插入意见记录之外的内容');
+  }
+}
+
+test('首次列表加载：含网页标记样文本与实体原文的意见逐字按普通文字展示，不解析标记、不影响相邻记录', async () => {
+  const h = new Harness(pageScript);
+  const plain = makeIdea({ id: 'r1', title: '普通意见', description: '普通说明', scenario: '普通场景' });
+  const markup = makeIdea({ id: 'r2', title: MARKUP_TITLE, description: MARKUP_DESCRIPTION, scenario: MARKUP_SCENARIO });
+  const entity = makeIdea({ id: 'r3', title: ENTITY_TITLE, description: ENTITY_DESCRIPTION, scenario: '' });
+  h.gets[0].resolve(jsonResponse(200, { ideas: [plain, markup, entity] }));
+  await flush();
+
+  // 含特殊文字的记录是合法意见：列表正常加载，不显示加载失败提示
+  assert.equal(h.els.empty.hidden, true);
+  assert.equal(h.els.error.hidden, true);
+  // 渲染不触发额外的网络请求（不加载图片、不执行片段中的动作）
+  assert.equal(h.getsIssued, 1);
+  assert.equal(h.postsIssued, 0);
+
+  // 排列保持接口次序，每条记录的字段各自对应、不串记录
+  const articles = h.articles();
+  assert.equal(articles.length, 3);
+  assertArticleMatches(articles[0], plain);
+  assertArticleMatches(articles[1], markup);
+  assertArticleMatches(articles[2], entity);
+  // 空字符串场景继续不显示“使用场景”段，也不被误报为异常
+  assert.equal(findScenario(articles[2]), undefined);
+
+  // “<b>重点</b>”连同尖括号一起读到：不能只剩“重点”，也不能变成加粗元素
+  const heading = articles[1].children.find((n) => n.tagName === 'H3')!;
+  assert.equal(heading.textContent, MARKUP_TITLE);
+  assert.ok(heading.textContent.includes('<b>重点</b>'));
+  assert.equal(heading.children.length, 0);
+
+  // 详细说明逐字保留：脚本、事件属性、链接、表单样文本与空行、首尾空白都在
+  const desc = articles[1].children.find((n) => n.tagName === 'P' && n.children.length === 0)!;
+  assert.equal(desc.textContent, MARKUP_DESCRIPTION);
+  assert.ok(desc.textContent.includes('<script>alert("x")</script>'));
+  assert.ok(desc.textContent.includes('<img src=x onerror="alert(1)">'));
+  assert.ok(desc.textContent.includes('\n\n'));
+  assert.equal(desc.children.length, 0);
+
+  // 使用场景同样逐字保留（含首尾空白与空行）
+  const scenarioText = findScenario(articles[1])!.children.find((n) => n.tagName === 'SPAN')!;
+  assert.equal(scenarioText.textContent, MARKUP_SCENARIO);
+  assert.equal(scenarioText.children.length, 0);
+
+  // 实体原文不解码也不再转义：读到的仍是 &lt;、&amp; 本身，而不是 < 或 &amp;lt;
+  const entityHeading = articles[2].children.find((n) => n.tagName === 'H3')!;
+  assert.equal(entityHeading.textContent, ENTITY_TITLE);
+  assert.ok(entityHeading.textContent.includes('&lt;b&gt;'));
+  assert.ok(!entityHeading.textContent.includes('<b>'));
+  const entityDesc = articles[2].children.find((n) => n.tagName === 'P' && n.children.length === 0)!;
+  assert.equal(entityDesc.textContent, ENTITY_DESCRIPTION);
+
+  assertPlainTextOnly(h);
+});
+
+test('提交成功后：含网页标记样文本的新意见按接口返回的记录逐字进入列表，表单按现有行为清空', async () => {
+  const h = new Harness(pageScript);
+  const existing = makeIdea({ id: 'r1', title: '已有意见', description: '已有说明' });
+  h.gets[0].resolve(jsonResponse(200, { ideas: [existing] }));
+  await flush();
+
+  // 标题带首尾空白：仍遵循现有处理（保存与展示去空白后的结果），不为这些片段另设规则
+  const typedTitle = '  ' + MARKUP_TITLE + '  ';
+  h.setForm({ title: typedTitle, description: MARKUP_DESCRIPTION, scenario: MARKUP_SCENARIO });
+  const submitted = h.submit();
+  assert.equal(h.postsIssued, 1);
+  // 请求体逐字携带原文：不为避免被当成网页结构而删改符号或整段内容
+  assert.deepEqual(JSON.parse(h.postBodies[0] as string), {
+    title: typedTitle,
+    description: MARKUP_DESCRIPTION,
+    scenario: MARKUP_SCENARIO,
+  });
+
+  // 接口实际返回的记录：标题已去首尾空白，详细说明与使用场景逐字保留
+  const saved = makeIdea({ id: 'a', title: MARKUP_TITLE, description: MARKUP_DESCRIPTION, scenario: MARKUP_SCENARIO });
+  h.posts[0].resolve(jsonResponse(201, { idea: saved }));
+  await submitted;
+  await flush();
+
+  // 这样的内容仍属合法意见：显示现有的成功提示，不出现提交失败
+  assert.equal(h.els.success.hidden, false);
+  assert.equal(h.els.success.textContent, SUCCESS_TEXT);
+  assert.equal(h.els.error.hidden, true);
+  // 等待期间没有继续编辑，三个输入框按现有行为清空
+  assert.equal(h.els['f-title'].value, '');
+  assert.equal(h.els['f-desc'].value, '');
+  assert.equal(h.els['f-scenario'].value, '');
+
+  // 新意见直接出现在列表最前，展示以接口返回为准；已有记录原样保留
+  const articles = h.articles();
+  assert.equal(articles.length, 2);
+  assertArticleMatches(articles[0], saved);
+  assertArticleMatches(articles[1], existing);
+  const heading = articles[0].children.find((n) => n.tagName === 'H3')!;
+  assert.equal(heading.textContent, MARKUP_TITLE);
+  assert.ok(heading.textContent.includes('<b>重点</b>'));
+  assert.equal(heading.children.length, 0);
+  assertPlainTextOnly(h);
+});
+
+test('实体写法、引号与尖括号随提交逐字保存并展示：不解码、不额外转义，各字段对应自己的记录', async () => {
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: [] }));
+  await flush();
+
+  h.setForm({ title: ENTITY_TITLE, description: ENTITY_DESCRIPTION, scenario: ENTITY_SCENARIO });
+  const submitted = h.submit();
+  assert.equal(h.postsIssued, 1);
+  assert.deepEqual(JSON.parse(h.postBodies[0] as string), {
+    title: ENTITY_TITLE,
+    description: ENTITY_DESCRIPTION,
+    scenario: ENTITY_SCENARIO,
+  });
+
+  const saved = makeIdea({ id: 'a', title: ENTITY_TITLE, description: ENTITY_DESCRIPTION, scenario: ENTITY_SCENARIO });
+  h.posts[0].resolve(jsonResponse(201, { idea: saved }));
+  await submitted;
+  await flush();
+
+  assert.equal(h.els.success.hidden, false);
+  assert.equal(h.els.error.hidden, true);
+  const articles = h.articles();
+  assert.equal(articles.length, 1);
+  assertArticleMatches(articles[0], saved);
+  // 逐字相等已保证不解码、不再转义；这里再明确钉住关键片段的字面内容
+  const heading = articles[0].children.find((n) => n.tagName === 'H3')!;
+  assert.ok(heading.textContent.includes('&lt;b&gt;'));
+  assert.ok(heading.textContent.includes('&amp;'));
+  const scenarioText = findScenario(articles[0])!.children.find((n) => n.tagName === 'SPAN')!;
+  assert.equal(scenarioText.textContent, ENTITY_SCENARIO);
+  assertPlainTextOnly(h);
+});
+
+test('特殊文字意见与普通意见混排：相邻记录与排列不受影响，表单仍可继续填写并正常提交下一条', async () => {
+  const h = new Harness(pageScript);
+  const plainA = makeIdea({ id: 'r1', title: '普通意见一', description: '普通说明一', scenario: '场景一' });
+  const markup = makeIdea({ id: 'r2', title: MARKUP_TITLE, description: MARKUP_DESCRIPTION, scenario: MARKUP_SCENARIO });
+  const plainB = makeIdea({ id: 'r3', title: '普通意见二', description: '普通说明二' });
+  h.gets[0].resolve(jsonResponse(200, { ideas: [plainA, markup, plainB] }));
+  await flush();
+
+  // 特殊文字不影响相邻记录的展示与原有排列
+  let articles = h.articles();
+  assert.equal(articles.length, 3);
+  assert.deepEqual(h.titles(), [plainA.title, markup.title, plainB.title]);
+  assertArticleMatches(articles[0], plainA);
+  assertArticleMatches(articles[1], markup);
+  assertArticleMatches(articles[2], plainB);
+
+  // 用户继续填写并正常提交下一条意见
+  h.edit('f-title', '下一条意见');
+  h.edit('f-desc', '下一条说明');
+  const submitted = h.submit();
+  assert.equal(h.postsIssued, 1);
+  const next = makeIdea({ id: 'a', title: '下一条意见', description: '下一条说明', scenario: '' });
+  h.posts[0].resolve(jsonResponse(201, { idea: next }));
+  await submitted;
+  await flush();
+
+  assert.equal(h.els.success.hidden, false);
+  assert.equal(h.els.success.textContent, SUCCESS_TEXT);
+  assert.equal(h.els.error.hidden, true);
+  // 新意见排最前，其余记录（含特殊文字记录）的次序与内容原样保留
+  articles = h.articles();
+  assert.equal(articles.length, 4);
+  assertArticleMatches(articles[0], next);
+  assertArticleMatches(articles[1], plainA);
+  assertArticleMatches(articles[2], markup);
+  assertArticleMatches(articles[3], plainB);
+  assertPlainTextOnly(h);
 });
