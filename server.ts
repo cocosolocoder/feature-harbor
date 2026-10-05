@@ -278,9 +278,25 @@ function respond(res: ServerResponse, status: number, value: unknown, options: {
     'content-length': Buffer.byteLength(body), ...(status === 405 ? { allow: options.allow ?? 'GET' } : {}) });
   res.end(body);
 }
+// 一条已有意见必须是 JSON 对象（不能是数组或空值）：id 为非空字符串，
+// title、description、scenario、createdAt 均存在且为字符串（scenario 允许为空字符串）。
+// 这里只检查历史记录的结构完整性，不套用新提交的内容限制：
+// 标题首尾空白、正文与场景换行、任意时间字符串都按原样保留，不补字段或改写文字。
+function isStoredIdea(record: unknown): boolean {
+  if (typeof record !== 'object' || record === null || Array.isArray(record)) return false;
+  const idea = record as Record<string, unknown>;
+  if (typeof idea.id !== 'string' || idea.id.length === 0) return false;
+  for (const field of ['title', 'description', 'scenario', 'createdAt'] as const) {
+    if (typeof idea[field] !== 'string') return false;
+  }
+  return true;
+}
 function readIdeas(): unknown[] {
   const records: unknown = JSON.parse(readFileSync(dataFile, 'utf8'));
   if (!Array.isArray(records)) throw new Error('Invalid record list');
+  // 任意一条记录结构不符，整份列表都视为读取失败：
+  // 不跳过异常记录，也不只返回正常部分。
+  if (!records.every(isStoredIdea)) throw new Error('Invalid idea record');
   return records;
 }
 function saveIdeas(records: unknown[]): void {

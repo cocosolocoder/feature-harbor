@@ -91,6 +91,34 @@ const CORRUPT_CASES: Array<{ name: string; content: string }> = [
     name: '是合法 JSON，但顶层是字符串而不是意见数组',
     content: '"this is not an ideas array"\n',
   },
+  {
+    name: '是合法的意见数组，但混入空值记录',
+    content: '[\n  {"id":"ok-1","title":"正常意见","description":"正常正文","scenario":"","createdAt":"2024-01-01T00:00:00.000Z"},\n  null\n]\n',
+  },
+  {
+    name: '是合法的意见数组，但混入数组记录',
+    content: '[{"id":"ok-2","title":"正常意见","description":"正常正文","scenario":"场景","createdAt":"2024-01-01T00:00:00.000Z"},["not","an","idea"]]\n',
+  },
+  {
+    name: '是合法的意见数组，但有记录缺少 title 等字段',
+    content: '[{"id":"broken-1","description":"缺标题与场景","createdAt":"2024-01-01T00:00:00.000Z"}]\n',
+  },
+  {
+    name: '异常记录排在首位、其后才是正常记录时，整份列表仍读取失败',
+    content: '[{"id":"broken-2"},{"id":"ok-3","title":"正常意见","description":"正常正文","scenario":"","createdAt":"2024-01-01T00:00:00.000Z"}]\n',
+  },
+  {
+    name: '记录缺少 scenario 字段（与 scenario 为空字符串不同）属于读取失败',
+    content: '[{"id":"broken-3","title":"没有场景字段","description":"正文","createdAt":"2024-01-01T00:00:00.000Z"}]\n',
+  },
+  {
+    name: '记录 id 为空字符串属于读取失败',
+    content: '[{"id":"","title":"空标识","description":"正文","scenario":"","createdAt":"2024-01-01T00:00:00.000Z"}]\n',
+  },
+  {
+    name: '字段类型错误（createdAt 为数字）属于读取失败',
+    content: '[{"id":"broken-4","title":"时间不是字符串","description":"正文","scenario":"","createdAt":1704067200000}]\n',
+  },
 ];
 
 test('已有数据无法读取为意见数组时：提交合法意见与查询列表都返回 500，且原有存储逐字节保留', async (t) => {
@@ -244,6 +272,52 @@ test('有已有记录时合法提交：新意见排在最前，旧记录的内�
     assert.deepEqual(after.data.ideas[1], oldIdea);
     assert.equal(after.data.ideas[1].id, 'fixed-old-id-0001');
     assert.equal(after.data.ideas[1].createdAt, '2024-01-02T03:04:05.678Z');
+  } finally {
+    await safeStop(server);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('结构完整的历史记录原样读取：scenario 空字符串正常，不套用新提交的内容限制', async () => {
+  const dir = freshDir();
+  const file = join(dir, 'ideas.json');
+  // 这些记录只要求结构完整：标题首尾空白、正文/场景换行保留；
+  // scenario 为空字符串与缺少 scenario 字段区分；时间字符串即使不能解析为日期也按原文读取。
+  const oldIdeas: Idea[] = [
+    {
+      id: 'edge-1',
+      title: '  标题带首尾空白  ',
+      description: '正文第一行\n第二行',
+      scenario: '',
+      createdAt: 'not-a-date-but-a-string',
+    },
+    {
+      id: 'edge-2',
+      title: '另一条',
+      description: '正文',
+      scenario: '场景带换行\n第二行',
+      createdAt: '2024-05-06T07:08:09.000Z',
+    },
+  ];
+  writeFileSync(file, `${JSON.stringify(oldIdeas, null, 2)}\n`, 'utf8');
+
+  let server: StartedServer | undefined;
+  try {
+    server = await startServer(dir);
+
+    // 结构完整即读取成功，文字、时间逐字段按原样返回，不做去空白或补字段。
+    const listed = await getIdeas(server);
+    assert.equal(listed.status, 200);
+    assert.deepEqual(listed.data.ideas, oldIdeas);
+
+    // 合法提交后新意见在最前，两条历史记录的标识、内容、时间与顺序原样保留。
+    const posted = await postNewIdea(server);
+    assert.equal(posted.status, 201);
+    const after = await getIdeas(server);
+    assert.equal(after.status, 200);
+    assert.equal(after.data.ideas.length, 3);
+    assert.deepEqual(after.data.ideas[0], posted.data.idea);
+    assert.deepEqual(after.data.ideas.slice(1), oldIdeas);
   } finally {
     await safeStop(server);
     rmSync(dir, { recursive: true, force: true });
