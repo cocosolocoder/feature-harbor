@@ -624,6 +624,139 @@ test('提交返回错误状态或非法响应：展示失败信息、保留表�
   }
 });
 
+// 提交返回 201 且响应体能解析，但整体内容不是一条完整意见：与「无法解析」「缺少整条 idea」
+// 一样按提交失败处理。异常形态包括：顶层不是含 idea 的对象、idea 是空值/数组/字符串等
+// 不能代表一条意见的内容、id 为空字符串或不是字符串、title/description/scenario/createdAt
+// 缺失或不是字符串。任何一类都不能显示成功、不能清空表单、不能插入列表，
+// 也不能拿提交时的表单文字去补齐响应缺失的字段。
+test('提交返回 201 但意见结构异常：显示提交失败、保留表单、已有记录数量次序内容不变', async (t) => {
+  const validIdea = (): Record<string, unknown> =>
+    makeIdea({ id: 'a', title: '响应里的标题', description: '响应里的说明', scenario: '响应里的场景' });
+  const cases = [
+    { name: '顶层为 null', body: null },
+    { name: '顶层为数组（数组里是完整意见也不行）', body: [validIdea()] },
+    { name: '顶层为字符串', body: 'saved' },
+    { name: '顶层为数字', body: 201 },
+    { name: 'idea 为 null', body: { idea: null } },
+    { name: 'idea 为数组', body: { idea: [validIdea()] } },
+    { name: 'idea 为普通字符串', body: { idea: 'a' } },
+    { name: 'idea 为数字', body: { idea: 1 } },
+    { name: 'idea 为空对象', body: { idea: {} } },
+    { name: '缺少 id', body: { idea: (() => { const r = validIdea(); delete r.id; return r; })() } },
+    { name: 'id 为空字符串（标题正文都在也不行）', body: { idea: { ...validIdea(), id: '' } } },
+    { name: 'id 不是字符串', body: { idea: { ...validIdea(), id: 7 } } },
+    { name: '缺少 title', body: { idea: (() => { const r = validIdea(); delete r.title; return r; })() } },
+    { name: 'title 不是字符串', body: { idea: { ...validIdea(), title: 1 } } },
+    { name: '缺少 description', body: { idea: (() => { const r = validIdea(); delete r.description; return r; })() } },
+    { name: 'description 不是字符串', body: { idea: { ...validIdea(), description: null } } },
+    { name: '缺少 scenario', body: { idea: (() => { const r = validIdea(); delete r.scenario; return r; })() } },
+    { name: 'scenario 不是字符串', body: { idea: { ...validIdea(), scenario: 0 } } },
+    { name: '缺少 createdAt', body: { idea: (() => { const r = validIdea(); delete r.createdAt; return r; })() } },
+    { name: 'createdAt 不是字符串', body: { idea: { ...validIdea(), createdAt: 0 } } },
+  ];
+  for (const c of cases) {
+    await t.test(c.name, async () => {
+      const h = new Harness(pageScript);
+      const r1 = makeIdea({ id: 'r1', title: '已有意见一', description: '已有说明一', scenario: '已有场景一', createdAt: '2026-02-01T01:01:01.000Z' });
+      const r2 = makeIdea({ id: 'r2', title: '已有意见二', description: '已有说明二', scenario: '', createdAt: '2026-02-02T02:02:02.000Z' });
+      h.gets[0].resolve(jsonResponse(200, { ideas: [r1, r2] }));
+      await flush();
+
+      h.setForm({ title: '新提交的标题', description: '新提交的说明', scenario: '新提交的场景' });
+      const failed = h.submit();
+      h.posts[0].resolve(jsonResponse(201, c.body));
+      await failed;
+      await flush();
+
+      // 结构异常的 201 不是字段填写错误：只显示现有的通用失败提示
+      assert.equal(h.els.error.hidden, false, c.name);
+      assert.equal(h.els.error.textContent, '提交失败，请稍后重试。', c.name);
+      assert.equal(h.els.success.hidden, true, c.name);
+      // 三个输入框内容原样保留
+      assert.equal(h.els['f-title'].value, '新提交的标题', c.name);
+      assert.equal(h.els['f-desc'].value, '新提交的说明', c.name);
+      assert.equal(h.els['f-scenario'].value, '新提交的场景', c.name);
+      // 不插入任何新意见（也不能先展示一条不完整意见等刷新纠正）：
+      // 已有记录的数量、顺序和内容保持原样
+      const articles = h.articles();
+      assert.equal(articles.length, 2, c.name);
+      assertArticleMatches(articles[0], r1);
+      assertArticleMatches(articles[1], r2);
+      // 失败后用户仍能继续编辑当前输入
+      h.edit('f-title', '继续修改的标题');
+      assert.equal(h.els['f-title'].value, '继续修改的标题', c.name);
+    });
+  }
+});
+
+test('提交收到结构异常的 201 后再次提交收到完整意见：显示成功、新意见排最前、表单清空、失败提示消失', async () => {
+  const h = new Harness(pageScript);
+  const r1 = makeIdea({ id: 'r1', title: '已有意见', description: '已有说明', scenario: '已有场景', createdAt: '2026-02-01T01:01:01.000Z' });
+  h.gets[0].resolve(jsonResponse(200, { ideas: [r1] }));
+  await flush();
+
+  h.setForm({ title: '重试的标题', description: '重试的说明', scenario: '重试的场景' });
+  const firstAttempt = h.submit();
+  // 201 且可解析、标题正文都在，但缺 createdAt：不能当成保存成功
+  const incomplete = makeIdea({ id: 'a', title: '重试的标题', description: '重试的说明', scenario: '重试的场景' });
+  delete incomplete.createdAt;
+  h.posts[0].resolve(jsonResponse(201, { idea: incomplete }));
+  await firstAttempt;
+  await flush();
+  assert.equal(h.els.error.hidden, false);
+  assert.equal(h.els.error.textContent, '提交失败，请稍后重试。');
+  assert.equal(h.els.success.hidden, true);
+  assert.deepEqual(h.titles(), ['已有意见']);
+
+  // 表单内容保留，直接再次提交；等待期间没有继续编辑
+  const mine = makeIdea({ id: 'b', title: '重试的标题', description: '重试的说明', scenario: '重试的场景', createdAt: '2026-03-01T00:00:00.000Z' });
+  const secondAttempt = h.submit();
+  assert.equal(h.postsIssued, 2);
+  h.posts[1].resolve(jsonResponse(201, { idea: mine }));
+  await secondAttempt;
+  await flush();
+
+  assert.equal(h.els.success.hidden, false);
+  assert.equal(h.els.success.textContent, SUCCESS_TEXT);
+  assert.equal(h.els.error.hidden, true);
+  assert.equal(h.els['f-title'].value, '');
+  assert.equal(h.els['f-desc'].value, '');
+  assert.equal(h.els['f-scenario'].value, '');
+  // 实际返回的意见排在列表最前，已有记录原样保留
+  const articles = h.articles();
+  assert.equal(articles.length, 2);
+  assertArticleMatches(articles[0], mine);
+  assertArticleMatches(articles[1], r1);
+});
+
+test('有效意见的使用场景可以是空字符串：与缺少场景字段区分；展示内容来自确认的记录而不是输入框', async () => {
+  const h = new Harness(pageScript);
+  const existing = makeIdea({ id: 'r1', title: '已有意见', description: '已有说明', scenario: '已有场景', createdAt: '2026-02-01T01:01:01.000Z' });
+  h.gets[0].resolve(jsonResponse(200, { ideas: [existing] }));
+  await flush();
+
+  // 输入框里的标题带首尾空白、场景非空；返回的记录是服务处理后的结果
+  // （标题已去空白、场景为空字符串），展示必须来自这条记录而不是当前输入
+  h.setForm({ title: '  带首尾空白的标题  ', description: '说明原文', scenario: '输入框里的场景' });
+  const submitted = h.submit();
+  const saved = makeIdea({ id: 'a', title: '带首尾空白的标题', description: '说明原文', scenario: '', createdAt: '2026-03-01T00:00:00.000Z' });
+  h.posts[0].resolve(jsonResponse(201, { idea: saved }));
+  await submitted;
+  await flush();
+
+  // 空字符串场景是正常记录：按成功处理，不与「缺少 scenario 字段」一并拒绝
+  assert.equal(h.els.success.hidden, false);
+  assert.equal(h.els.success.textContent, SUCCESS_TEXT);
+  assert.equal(h.els.error.hidden, true);
+  const articles = h.articles();
+  assert.equal(articles.length, 2);
+  // 标题是去空白后的结果、空字符串场景不显示场景行（不用输入框文字替代）、
+  // 提交时间来自记录；新意见与已有记录分别对应
+  assertArticleMatches(articles[0], saved);
+  assert.equal(findScenario(articles[0]), undefined);
+  assertArticleMatches(articles[1], existing);
+});
+
 test('提交失败后再次提交成功：失败提示清除、表单清空、新意见与已有意见同时展示', async () => {
   const h = new Harness(pageScript);
   const r1 = makeIdea({ id: 'r1', title: '已有意见' });
