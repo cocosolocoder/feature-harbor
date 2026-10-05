@@ -26,6 +26,9 @@ node server.ts serve --host 127.0.0.1 --port 8080 --data-dir data
 - 未知路径返回 404，已知路径不支持的方法返回 405。
 - 首页 `/` 提供提交表单和意见列表，数据保存在 `--data-dir` 指定的目录中，重启后保留。
 
+字段规则（必填、空白处理与字符上限）只在 `idea-fields.ts` 维护一次：接口直接调用它，首页无法使用模块导入，由 `server.ts` 把同一份函数源码注入内联脚本，因此页面说明、两个入口的提示与实际保存判定始终一致；长度统一按 Unicode 码点（`Array.from(text).length`）计算。
+
+
 ```sh
 curl http://127.0.0.1:8080/health
 curl http://127.0.0.1:8080/api/ideas

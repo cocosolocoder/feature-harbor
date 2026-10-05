@@ -3,13 +3,25 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import {
+  FIELD_LIMITS,
+  checkIdeaContent,
+  normalizeIdea,
+  fieldRulesBrowserScript,
+  type ContentErrorCode,
+} from './idea-fields.ts';
 
 const PRODUCT: string = 'FeatureHarbor';
 const RESOURCE: string = 'ideas';
-const MAX_TITLE = 120;
-const MAX_DESCRIPTION = 5000;
-const MAX_SCENARIO = 1000;
 const MAX_BODY_BYTES = 1_000_000;
+// 接口侧把共用的内容判定结果映射成原有的错误说明；首页另有自己的措辞。
+const CONTENT_ERROR_MESSAGES: Record<ContentErrorCode, string> = {
+  'title-empty': '标题去掉首尾空白后不能为空',
+  'title-too-long': `标题最多 ${FIELD_LIMITS.title} 个字符`,
+  'description-empty': '详细说明必须包含非空白内容',
+  'description-too-long': `详细说明最多 ${FIELD_LIMITS.description} 个字符`,
+  'scenario-too-long': `使用场景最多 ${FIELD_LIMITS.scenario} 个字符`,
+};
 const PAGE: string = `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>FeatureHarbor · 产品意见与公开路线图</title><style>
 body{font-family:system-ui,sans-serif;max-width:52rem;margin:3rem auto;padding:0 1rem;line-height:1.7}
 a{color:#175b9c}
@@ -27,11 +39,11 @@ time{color:#666;font-size:.9rem}
 </style><main><h1>FeatureHarbor</h1><p>产品意见与公开路线图</p>
 <h2>提交产品意见</h2>
 <form id="idea-form" novalidate>
-<label for="f-title">标题 <span class="required">*</span>（必填，最多 120 字）</label>
+<label for="f-title">标题 <span class="required">*</span>（必填，最多 ${FIELD_LIMITS.title} 字）</label>
 <input id="f-title" name="title" required>
-<label for="f-desc">详细说明 <span class="required">*</span>（必填，最多 5000 字）</label>
+<label for="f-desc">详细说明 <span class="required">*</span>（必填，最多 ${FIELD_LIMITS.description} 字）</label>
 <textarea id="f-desc" name="description" rows="5" required></textarea>
-<label for="f-scenario">使用场景（可选，最多 1000 字）</label>
+<label for="f-scenario">使用场景（可选，最多 ${FIELD_LIMITS.scenario} 字）</label>
 <textarea id="f-scenario" name="scenario" rows="3"></textarea>
 <button type="submit">提交意见</button>
 <p id="error" role="alert" hidden></p>
@@ -42,6 +54,7 @@ time{color:#666;font-size:.9rem}
 <div id="ideas"></div>
 <p><a href="/api/ideas">查看意见列表接口</a> · <a href="/health">服务状态</a></p>
 </main><script>
+${fieldRulesBrowserScript}
 const form = document.getElementById('idea-form');
 const titleInput = document.getElementById('f-title');
 const descInput = document.getElementById('f-desc');
@@ -54,7 +67,6 @@ const EMPTY_TEXT = '还没有意见记录。';
 const LOAD_FAILED_TEXT = '意见列表加载失败，请稍后刷新重试。';
 // 首次列表请求的状态：loading（进行中）/ ready（成功）/ failed（失败）
 let listState = 'loading';
-function codePoints(text) { return Array.from(text).length; }
 function showError(message) {
   errorBox.textContent = message;
   errorBox.hidden = false;
@@ -148,14 +160,17 @@ let editVersion = 0;
 for (const field of [titleInput, descInput, scenarioInput]) {
   field.addEventListener('input', () => { editVersion += 1; });
 }
+// 字段内容判定与接口共用同一份实现（FIELD_LIMITS、codePointCount、checkIdeaContent
+// 由 idea-fields.ts 注入）；这里只把共用判定结果映射成本页原有的提示措辞与顺序。
 function validate(title, description, scenario) {
-  const trimmed = title.trim();
-  if (!trimmed) return '标题不能为空。';
-  if (codePoints(trimmed) > 120) return '标题最多 120 个字符。';
-  if (!description.trim()) return '详细说明不能为空。';
-  if (codePoints(description) > 5000) return '详细说明最多 5000 个字符。';
-  if (codePoints(scenario) > 1000) return '使用场景最多 1000 个字符。';
-  return null;
+  switch (checkIdeaContent(title, description, scenario)) {
+    case 'title-empty': return '标题不能为空。';
+    case 'title-too-long': return '标题最多 ' + FIELD_LIMITS.title + ' 个字符。';
+    case 'description-empty': return '详细说明不能为空。';
+    case 'description-too-long': return '详细说明最多 ' + FIELD_LIMITS.description + ' 个字符。';
+    case 'scenario-too-long': return '使用场景最多 ' + FIELD_LIMITS.scenario + ' 个字符。';
+    default: return null;
+  }
 }
 // 每次点击提交都递增：成功或失败提示只属于最近一次点击。
 // 更早发出的请求即使更晚返回，也只能在服务确认保存时更新列表，不能改动当前提示。
@@ -263,9 +278,6 @@ function respond(res: ServerResponse, status: number, value: unknown, options: {
     'content-length': Buffer.byteLength(body), ...(status === 405 ? { allow: options.allow ?? 'GET' } : {}) });
   res.end(body);
 }
-function codePoints(text: string): number {
-  return Array.from(text).length;
-}
 function readIdeas(): unknown[] {
   const records: unknown = JSON.parse(readFileSync(dataFile, 'utf8'));
   if (!Array.isArray(records)) throw new Error('Invalid record list');
@@ -308,14 +320,16 @@ async function handleCreateIdea(req: IncomingMessage, res: ServerResponse): Prom
     respond(res, 400, { error: '字段 scenario 必须是字符串' });
     return;
   }
-  const title = (body.title as string).trim();
-  const description = body.description as string;
+  const rawTitle = body.title as string;
+  const rawDescription = body.description as string;
   const scenario = typeof body.scenario === 'string' ? body.scenario : '';
-  if (!title) { respond(res, 400, { error: '标题去掉首尾空白后不能为空' }); return; }
-  if (codePoints(title) > MAX_TITLE) { respond(res, 400, { error: `标题最多 ${MAX_TITLE} 个字符` }); return; }
-  if (!description.trim()) { respond(res, 400, { error: '详细说明必须包含非空白内容' }); return; }
-  if (codePoints(description) > MAX_DESCRIPTION) { respond(res, 400, { error: `详细说明最多 ${MAX_DESCRIPTION} 个字符` }); return; }
-  if (codePoints(scenario) > MAX_SCENARIO) { respond(res, 400, { error: `使用场景最多 ${MAX_SCENARIO} 个字符` }); return; }
+  // 内容规则（空白与上限）与首页共用同一份判定，这里只保留接口原有的错误措辞。
+  const problem = checkIdeaContent(rawTitle, rawDescription, scenario);
+  if (problem) {
+    respond(res, 400, { error: CONTENT_ERROR_MESSAGES[problem] });
+    return;
+  }
+  const { title, description } = normalizeIdea(rawTitle, rawDescription, scenario);
   const idea = {
     id: randomUUID(),
     title,
