@@ -128,6 +128,7 @@ const SUCCESS_TEXT = '提交成功，你的意见已保存。';
 const EMPTY_TEXT = '还没有意见记录。';
 const LOAD_FAILED_TEXT = '意见列表加载失败，请稍后刷新重试。';
 const NETWORK_ERROR_TEXT = '网络错误，提交未成功，请重试。';
+const SUBMIT_FAILED_TEXT = '提交失败，请稍后重试。';
 
 class Harness {
   els: Record<string, El> = {};
@@ -624,6 +625,220 @@ test('提交返回错误状态或非法响应：展示失败信息、保留表�
   }
 });
 
+// 201 表示服务端接受了请求，但页面只承认「确认返回的完整记录」：
+// 响应必须可解析为带 idea 的 JSON 对象，且 idea 自身结构完整（非空字符串 id，
+// title、description、scenario、createdAt 全部存在且为字符串）。
+// 下面的用例只覆盖「响应可解析、状态为 201、但 idea 结构异常」这一类——
+// 响应无法解析与整条 idea 缺失已由上面的用例覆盖。
+function malformedSuccessBodies(): Array<{ name: string; body: unknown }> {
+  const text = {
+    id: 'a',
+    title: '返回的标题',
+    description: '返回的说明',
+    scenario: '返回的场景',
+    createdAt: '2026-03-01T00:00:00.000Z',
+  };
+  const without = (field: string): Record<string, unknown> => {
+    const record = { ...text };
+    delete record[field];
+    return record;
+  };
+  return [
+    // 顶层不是包含 idea 的对象
+    { name: '顶层为 null', body: null },
+    { name: '顶层为数组', body: [{ idea: text }] },
+    { name: '顶层为普通字符串', body: JSON.stringify({ idea: text }) },
+    { name: '顶层为数字', body: 1 },
+    { name: '顶层没有 idea 字段（其他字段完整）', body: { saved: true, title: text.title } },
+    // idea 是空值、数组或普通字符串等不能代表一条意见的内容
+    { name: 'idea 为 null', body: { idea: null } },
+    { name: 'idea 为 undefined（字段存在但无值）', body: { idea: undefined } },
+    { name: 'idea 为数组', body: { idea: [text] } },
+    { name: 'idea 为普通字符串', body: { idea: '返回的标题' } },
+    { name: 'idea 为数字', body: { idea: 1 } },
+    // idea 是对象、也带标题和正文，但标识不合法
+    { name: 'id 为空字符串', body: { idea: { ...text, id: '' } } },
+    { name: 'id 缺失', body: { idea: without('id') } },
+    { name: 'id 为数字', body: { idea: { ...text, id: 1 } } },
+    { name: 'id 为 null', body: { idea: { ...text, id: null } } },
+    { name: 'id 为数组', body: { idea: { ...text, id: [] } } },
+    // 标题、详细说明、使用场景、提交时间缺失或不是字符串
+    { name: 'title 缺失', body: { idea: without('title') } },
+    { name: 'title 为数字', body: { idea: { ...text, title: 1 } } },
+    { name: 'title 为 null', body: { idea: { ...text, title: null } } },
+    { name: 'description 缺失', body: { idea: without('description') } },
+    { name: 'description 为数字', body: { idea: { ...text, description: 1 } } },
+    { name: 'scenario 缺失（与空字符串不同）', body: { idea: without('scenario') } },
+    { name: 'scenario 为数字', body: { idea: { ...text, scenario: 0 } } },
+    { name: 'scenario 为 null', body: { idea: { ...text, scenario: null } } },
+    { name: 'createdAt 缺失', body: { idea: without('createdAt') } },
+    { name: 'createdAt 为数字', body: { idea: { ...text, createdAt: 0 } } },
+    { name: 'createdAt 为 null', body: { idea: { ...text, createdAt: null } } },
+  ];
+}
+
+test('201 但响应整体或 idea 结构异常：显示提交失败、保留三个输入框、不插入任何意见，已有记录的数量、顺序与内容保持原样', async (t) => {
+  // 已有记录用不同的标题、说明、场景与时间，以便逐条核对失败后没有被改动或重排
+  const existing = [
+    makeIdea({ id: 'r1', title: '已有意见一', description: '已有说明一', scenario: '已有场景一', createdAt: '2026-01-01T01:01:01.000Z' }),
+    makeIdea({ id: 'r2', title: '已有意见二', description: '已有说明二', scenario: '', createdAt: '2026-02-02T02:02:02.000Z' }),
+    makeIdea({ id: 'r3', title: '已有意见三', description: '已有说明三', scenario: '已有场景三', createdAt: '2026-03-03T03:03:03.000Z' }),
+  ];
+  for (const c of malformedSuccessBodies()) {
+    await t.test(c.name, async () => {
+      const h = new Harness(pageScript);
+      h.gets[0].resolve(jsonResponse(200, { ideas: existing }));
+      await flush();
+
+      // 表单文字故意与响应里带回的文字不同：不能拿提交时的表单文字补齐缺失字段
+      h.setForm({ title: '表单里的标题', description: '表单里的说明', scenario: '表单里的场景' });
+      const failed = h.submit();
+      assert.equal(h.postsIssued, 1, c.name);
+      h.posts[0].resolve(jsonResponse(201, c.body));
+      await failed;
+      await flush();
+
+      // 显示现有的提交失败提示（不是字段校验错误，也没有成功提示）
+      assert.equal(h.els.error.hidden, false, c.name);
+      assert.equal(h.els.error.textContent, SUBMIT_FAILED_TEXT, c.name);
+      assert.equal(h.els.success.hidden, true, c.name);
+      // 三个输入框的内容原样保留，用户可以继续编辑后重试
+      assert.equal(h.els['f-title'].value, '表单里的标题', c.name);
+      assert.equal(h.els['f-desc'].value, '表单里的说明', c.name);
+      assert.equal(h.els['f-scenario'].value, '表单里的场景', c.name);
+      // 列表数量不变；逐条核对顺序与全部字段，不允许先插入不完整意见
+      const articles = h.articles();
+      assert.equal(articles.length, existing.length, c.name);
+      existing.forEach((idea, index) => assertArticleMatches(articles[index], idea));
+    });
+  }
+});
+
+test('201 结构异常的失败响应到达后用户可继续编辑，随后收到完整记录：显示成功、把实际返回的意见放到列表最前、清空未继续编辑的表单，失败提示消失', async () => {
+  const existing = [
+    makeIdea({ id: 'r1', title: '已有意见一', description: '已有说明一', scenario: '已有场景一', createdAt: '2026-01-01T01:01:01.000Z' }),
+    makeIdea({ id: 'r2', title: '已有意见二', description: '已有说明二', scenario: '', createdAt: '2026-02-02T02:02:02.000Z' }),
+  ];
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: existing }));
+  await flush();
+
+  // 第一次提交：201 可解析，但 idea 缺 createdAt
+  h.setForm({ title: '第一次的标题', description: '第一次的说明', scenario: '第一次的场景' });
+  const firstAttempt = h.submit();
+  h.posts[0].resolve(jsonResponse(201, {
+    idea: { id: 'bad', title: '第一次的标题', description: '第一次的说明', scenario: '第一次的场景' },
+  }));
+  await firstAttempt;
+  await flush();
+  assert.equal(h.els.error.hidden, false);
+  assert.equal(h.els.error.textContent, SUBMIT_FAILED_TEXT);
+  assert.equal(h.els.success.hidden, true);
+  assert.equal(h.articles().length, existing.length);
+
+  // 用户继续编辑当前输入（失败没有打断编辑），随后再次提交
+  h.edit('f-title', '重试后的标题');
+  h.edit('f-desc', '重试后的说明');
+  h.edit('f-scenario', '重试后的场景');
+  const secondAttempt = h.submit();
+  assert.equal(h.postsIssued, 2);
+  // 发起新提交后上一条失败提示先消失
+  assert.equal(h.els.error.hidden, true);
+  assert.equal(h.els.success.hidden, true);
+
+  // 这次返回结构完整的记录，且字段以实际响应为准（与表单文字刻意不同）
+  const saved = makeIdea({
+    id: 'a',
+    title: '服务确认的标题',
+    description: '服务确认的说明',
+    scenario: '服务确认的场景',
+    createdAt: '2026-04-04T04:04:04.000Z',
+  });
+  h.posts[1].resolve(jsonResponse(201, { idea: saved }));
+  await secondAttempt;
+  await flush();
+
+  assert.equal(h.els.success.hidden, false);
+  assert.equal(h.els.success.textContent, SUCCESS_TEXT);
+  assert.equal(h.els.error.hidden, true);
+  // 等待期间没有继续编辑：三个输入框清空
+  assert.equal(h.els['f-title'].value, '');
+  assert.equal(h.els['f-desc'].value, '');
+  assert.equal(h.els['f-scenario'].value, '');
+  // 实际返回的意见在最前，失败那次没有留下任何记录，已有意见顺序与内容不变
+  const articles = h.articles();
+  assert.equal(articles.length, existing.length + 1);
+  assertArticleMatches(articles[0], saved);
+  assertArticleMatches(articles[1], existing[0]);
+  assertArticleMatches(articles[2], existing[1]);
+});
+
+test('201 结构异常后等待期间未编辑再提交成功：表单清空，失败提示不残留', async () => {
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: [] }));
+  await flush();
+
+  h.setForm({ title: '标题', description: '说明', scenario: '场景' });
+  const firstAttempt = h.submit();
+  // idea 的 id 不是字符串
+  h.posts[0].resolve(jsonResponse(201, { idea: { id: 7, title: '标题', description: '说明', scenario: '场景', createdAt: '2026-04-04T04:04:04.000Z' } }));
+  await firstAttempt;
+  await flush();
+  assert.equal(h.els.error.hidden, false);
+  assert.equal(h.els['f-title'].value, '标题');
+  assert.equal(h.articles().length, 0);
+
+  // 不改动任何输入，直接再次提交；这次记录完整
+  const secondAttempt = h.submit();
+  const saved = makeIdea({ id: 'a', title: '标题', description: '说明', scenario: '场景' });
+  h.posts[1].resolve(jsonResponse(201, { idea: saved }));
+  await secondAttempt;
+  await flush();
+
+  assert.equal(h.els.success.hidden, false);
+  assert.equal(h.els.error.hidden, true);
+  assert.equal(h.els['f-title'].value, '');
+  assert.equal(h.els['f-desc'].value, '');
+  assert.equal(h.els['f-scenario'].value, '');
+  assert.equal(h.articles().length, 1);
+});
+
+test('提交成功的边界：idea 的使用场景为空字符串与缺少 scenario 字段不同，空字符串记录按成功展示且字段全部来自该记录', async () => {
+  const existing = makeIdea({ id: 'r1', title: '已有意见', description: '已有说明', scenario: '已有场景', createdAt: '2026-01-01T00:00:00.000Z' });
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: [existing] }));
+  await flush();
+
+  // 表单文字与响应不同：展示内容必须来自已确认记录，不能用输入框文字替代
+  h.setForm({ title: '表单标题', description: '表单说明', scenario: '表单场景' });
+  const submitted = h.submit();
+  const saved = makeIdea({
+    id: 'a',
+    title: '空场景的确认标题',
+    description: '空场景的确认说明',
+    scenario: '',
+    createdAt: '2026-05-05T05:05:05.000Z',
+  });
+  h.posts[0].resolve(jsonResponse(201, { idea: saved }));
+  await submitted;
+  await flush();
+
+  assert.equal(h.els.success.hidden, false);
+  assert.equal(h.els.success.textContent, SUCCESS_TEXT);
+  assert.equal(h.els.error.hidden, true);
+  assert.equal(h.els['f-title'].value, '');
+  assert.equal(h.els['f-desc'].value, '');
+  assert.equal(h.els['f-scenario'].value, '');
+  const articles = h.articles();
+  assert.equal(articles.length, 2);
+  // 新记录在最前：标题、说明、提交时间来自响应，空场景不展示“使用场景”段
+  assertArticleMatches(articles[0], saved);
+  assert.equal(findScenario(articles[0]), undefined);
+  assert.equal(articles[0].children.find((n) => n.tagName === 'TIME')!.dateTime, saved.createdAt);
+  // 已有记录原样保留、各自字段不串
+  assertArticleMatches(articles[1], existing);
+});
+
 test('提交失败后再次提交成功：失败提示清除、表单清空、新意见与已有意见同时展示', async () => {
   const h = new Harness(pageScript);
   const r1 = makeIdea({ id: 'r1', title: '已有意见' });
@@ -848,13 +1063,18 @@ test('两条提交在途且期间未编辑：先返回的成功清空表单，�
 // 再次点击提交，更早请求迟到的任何结果都不能改动当前提示；但旧请求被服务确认保存的意见
 // 仍必须进入列表。下列用例精确控制两个 POST 的返回先后与结果类型。
 
-function settleGate(g: Gate, outcome: 'network-error' | 'server-reject' | 'broken-json' | 'missing-idea'): void {
+function settleGate(g: Gate, outcome: 'network-error' | 'server-reject' | 'broken-json' | 'missing-idea' | 'malformed-idea'): void {
   if (outcome === 'network-error') {
     g.reject(new TypeError('Failed to fetch'));
   } else if (outcome === 'server-reject') {
     g.resolve(jsonResponse(400, { error: '较早一次提交被拒绝' }));
   } else if (outcome === 'broken-json') {
     g.resolve(brokenJsonResponse(201));
+  } else if (outcome === 'malformed-idea') {
+    // 可解析的 201：标题、正文、场景都带回来了，但缺少 createdAt，记录结构仍不完整
+    g.resolve(jsonResponse(201, {
+      idea: { id: 'stale', title: '迟到的标题', description: '迟到的说明', scenario: '' },
+    }));
   } else {
     g.resolve(jsonResponse(201, { saved: true }));
   }
@@ -865,6 +1085,7 @@ const STALE_FAILURE_KINDS = [
   { name: '服务拒绝（400）', outcome: 'server-reject' as const },
   { name: '201 但响应无法解析', outcome: 'broken-json' as const },
   { name: '201 但内容不完整（缺 idea）', outcome: 'missing-idea' as const },
+  { name: '201 但意见结构异常（idea 缺 createdAt）', outcome: 'malformed-idea' as const },
 ];
 
 test('后一次提交先确认保存后，较早请求迟到的各类失败都不能把成功提示改成失败', async (t) => {
