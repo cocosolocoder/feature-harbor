@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import {
   chmodSync,
   existsSync,
@@ -9,6 +10,7 @@ import {
   readFileSync,
   rmdirSync,
   rmSync,
+  writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -20,10 +22,12 @@ import { startServer, type StartedServer } from '../testing/server.ts';
 //   1. POST 返回 500 与现有的 error（“保存意见失败，请稍后重试”），不是 201，
 //      响应不带表示已保存的 idea，也不算字段错误 400 或读取历史失败；
 //   2. 失败不损伤此前收集到的意见：列表数量、顺序、id、createdAt 与逐条文字不变，
-//      ideas.json 与请求前逐字节一致，不残留服务写出的 .tmp 普通文件，失败的新意见不混入；
-//   3. 保存位置恢复后，重新提交同一条合法意见返回 201，新意见排在原有意见之前，
+//      ideas.json 与请求前逐字节一致，失败的新意见不混入；
+//   3. 临时内容已写入但替换正式文件失败时，本次写出的 .tmp 普通文件被清除，
+//      不被误认成已保存数据；清理本身因权限失败时也只放弃清理，响应与正式数据不变；
+//   4. 保存位置恢复后，重新提交同一条合法意见返回 201，新意见排在原有意见之前，
 //      列表只多出这一条，旧记录相对顺序与内容不变；
-//   4. 此前没有任何意见时失败，列表仍成功返回空数组，磁盘仍是初始的 []，不出现半条记录。
+//   5. 此前没有任何意见时失败，列表仍成功返回空数组，磁盘仍是初始的 []，不出现半条记录。
 
 interface Idea {
   id: string;
@@ -63,13 +67,47 @@ const SEED_PAYLOADS: unknown[] = [
 
 interface Blocker {
   name: string;
-  enable: (dataDir: string, tmpFile: string) => void;
-  disable: (dataDir: string, tmpFile: string) => void;
-  // 失败请求结束后 tmpFile 的预期形态：目录型阻塞下 tmpFile 是测试注入的目录，
-  // 只读目录型阻塞下服务连临时文件都不应创建。
-  tmpExpectation: 'injected-directory' | 'absent';
+  enable: (dataDir: string, file: string, tmpFile: string) => void;
+  disable: (dataDir: string, file: string, tmpFile: string) => void;
+  // 失败请求结束后 tmpFile 的预期形态：目录型阻塞下 tmpFile 是测试注入的目录；
+  // 服务写出的临时普通文件可被删除时为 absent（不存在或已被服务清除）；
+  // 临时文件已写出但目录只读导致服务无法删除时为 leftover-file（仍是普通文件）。
+  tmpExpectation: 'injected-directory' | 'absent' | 'leftover-file';
   // root 进程拥有 CAP_DAC_OVERRIDE，chmod 只读不会真正阻止写入，这类环境下跳过该用例。
   requiresNonRoot?: boolean;
+  // 注入方式本身依赖环境能力（如 chattr 需要 CAP_LINUX_IMMUTABLE），
+  // 返回 false 时跳过该用例。
+  isAvailable?: () => boolean;
+}
+
+// 探测当前环境能否给文件设置 immutable 标志（chattr +i 需要 CAP_LINUX_IMMUTABLE，
+// 普通用户与部分容器内的 root 都不具备）；探测结果缓存，避免每个用例重复执行。
+let immutableSupported: boolean | undefined;
+function supportsImmutable(): boolean {
+  if (immutableSupported !== undefined) return immutableSupported;
+  const dir = freshDir();
+  const probe = join(dir, 'probe');
+  writeFileSync(probe, 'x');
+  try {
+    execFileSync('chattr', ['+i', probe], { stdio: ['ignore', 'ignore', 'ignore'] });
+    immutableSupported = true;
+  } catch {
+    immutableSupported = false;
+  }
+  if (immutableSupported) {
+    try {
+      execFileSync('chattr', ['-i', probe], { stdio: ['ignore', 'ignore', 'ignore'] });
+    } catch {
+      // 还原失败时下面的 rmSync 会连带失败，按不支持处理
+      immutableSupported = false;
+    }
+  }
+  try {
+    rmSync(dir, { recursive: true, force: true });
+  } catch {
+    immutableSupported = false;
+  }
+  return immutableSupported;
 }
 
 const BLOCKERS: Blocker[] = [
@@ -77,8 +115,8 @@ const BLOCKERS: Blocker[] = [
     // saveIdeas 先写 ideas.json.tmp 再 rename；在该路径放一个目录，
     // writeFileSync 以 EISDIR 失败，rename 根本不会执行。
     name: '临时文件路径被目录占用（writeFileSync EISDIR）',
-    enable: (_dataDir, tmpFile) => mkdirSync(tmpFile),
-    disable: (_dataDir, tmpFile) => rmdirSync(tmpFile),
+    enable: (_dataDir, _file, tmpFile) => mkdirSync(tmpFile),
+    disable: (_dataDir, _file, tmpFile) => rmdirSync(tmpFile),
     tmpExpectation: 'injected-directory',
   },
   {
@@ -87,6 +125,31 @@ const BLOCKERS: Blocker[] = [
     enable: (dataDir) => chmodSync(dataDir, 0o555),
     disable: (dataDir) => chmodSync(dataDir, 0o755),
     tmpExpectation: 'absent',
+    requiresNonRoot: true,
+  },
+  {
+    // 正式文件不可变（chattr +i）：临时文件写入成功，rename 替换以 EPERM 失败；
+    // 数据目录仍可写，本次写出的临时普通文件应被服务清除。
+    name: '临时文件已写入但替换正式文件失败（rename EPERM）',
+    enable: (_dataDir, file) => execFileSync('chattr', ['+i', file]),
+    disable: (_dataDir, file) => execFileSync('chattr', ['-i', file]),
+    tmpExpectation: 'absent',
+    isAvailable: supportsImmutable,
+  },
+  {
+    // 替换失败且临时文件无法删除：预先放置可写的普通临时文件使 writeFileSync 成功，
+    // 数据目录只读使 rename 与清理临时文件都以 EACCES 失败；
+    // 响应仍须是正常的保存失败，正式数据不动，遗留的临时普通文件保持普通文件形态。
+    name: '替换失败且临时文件因权限无法删除（rename/unlink EACCES）',
+    enable: (dataDir, _file, tmpFile) => {
+      writeFileSync(tmpFile, '');
+      chmodSync(dataDir, 0o555);
+    },
+    disable: (dataDir, _file, tmpFile) => {
+      chmodSync(dataDir, 0o755);
+      rmSync(tmpFile, { force: true });
+    },
+    tmpExpectation: 'leftover-file',
     requiresNonRoot: true,
   },
 ];
@@ -157,9 +220,9 @@ function assertSaveFailureResponse(result: { status: number; contentType: string
 
 // finally 中恢复环境：无论断言是否失败，先解除阻塞（含只读权限），
 // 否则临时目录本身都可能无法删除。
-function restoreBlocker(blocker: Blocker, dir: string, tmpFile: string): void {
+function restoreBlocker(blocker: Blocker, dir: string, file: string, tmpFile: string): void {
   try {
-    blocker.disable(dir, tmpFile);
+    blocker.disable(dir, file, tmpFile);
   } catch {
     // 阻塞物可能已解除（如目录已不在），忽略清理时的恢复异常。
   }
@@ -170,6 +233,10 @@ test('保存位置无法写入：合法提交返回 500 且不损伤已有意见
     await t.test(blocker.name, async (st) => {
       if (blocker.requiresNonRoot && typeof process.getuid === 'function' && process.getuid() === 0) {
         st.skip('root 进程下只读目录不构成写入失败，跳过该注入方式');
+        return;
+      }
+      if (blocker.isAvailable && !blocker.isAvailable()) {
+        st.skip('当前环境不支持该注入方式，跳过该用例');
         return;
       }
       const dir = freshDir();
@@ -200,7 +267,7 @@ test('保存位置无法写入：合法提交返回 500 且不损伤已有意见
         const beforeBytes = readFileSync(file);
 
         // 让保存位置无法写入；已有数据本身仍可正常读取。
-        blocker.enable(dir, tmpFile);
+        blocker.enable(dir, file, tmpFile);
 
         // 第一次失败：500 + 现有错误说明，不是 201/400，响应不带 idea。
         const failed1 = await postIdea(server, NEW_IDEA);
@@ -212,10 +279,14 @@ test('保存位置无法写入：合法提交返回 500 且不损伤已有意见
         assert.deepEqual(afterFail1.data.ideas, seeded);
 
         // 磁盘上的原有数据逐字节保留：不清空、不改格式、不被只含新意见的内容覆盖；
-        // 也不残留服务写出的 .tmp 普通文件。
+        // 也不残留服务写出的 .tmp 普通文件（除非本次清理本身因权限失败）。
         assert.ok(readFileSync(file).equals(beforeBytes), '保存失败后 ideas.json 被改动');
         if (blocker.tmpExpectation === 'absent') {
           assert.equal(existsSync(tmpFile), false, '失败后不应留下临时文件');
+        } else if (blocker.tmpExpectation === 'leftover-file') {
+          // 临时文件已写出且因目录只读无法删除：允许遗留，但必须仍是普通文件，
+          // 正式数据与失败响应不受清理失败影响。
+          assert.ok(existsSync(tmpFile) && lstatSync(tmpFile).isFile());
         } else {
           // 目录型阻塞：留在原地的只是测试注入的目录，服务没有把它写成普通文件。
           assert.ok(existsSync(tmpFile) && lstatSync(tmpFile).isDirectory());
@@ -230,7 +301,7 @@ test('保存位置无法写入：合法提交返回 500 且不损伤已有意见
         assert.ok(readFileSync(file).equals(beforeBytes), '再次保存失败后 ideas.json 被改动');
 
         // 保存位置恢复：列表依旧原样，恢复写入能力本身不应改动任何数据。
-        blocker.disable(dir, tmpFile);
+        blocker.disable(dir, file, tmpFile);
         assert.equal(existsSync(tmpFile), false, '恢复后不应残留临时文件');
         const afterRecoverList = await getIdeas(server);
         assert.equal(afterRecoverList.status, 200);
@@ -266,7 +337,7 @@ test('保存位置无法写入：合法提交返回 500 且不损伤已有意见
         assert.deepEqual(afterRestart.data.ideas, [savedIdea, ...seeded]);
         assert.equal(existsSync(tmpFile), false);
       } finally {
-        restoreBlocker(blocker, dir, tmpFile);
+        restoreBlocker(blocker, dir, file, tmpFile);
         await safeStop(server);
         rmSync(dir, { recursive: true, force: true });
       }
@@ -279,6 +350,10 @@ test('此前没有任何意见时保存失败：列表仍成功返回空数组�
     await t.test(blocker.name, async (st) => {
       if (blocker.requiresNonRoot && typeof process.getuid === 'function' && process.getuid() === 0) {
         st.skip('root 进程下只读目录不构成写入失败，跳过该注入方式');
+        return;
+      }
+      if (blocker.isAvailable && !blocker.isAvailable()) {
+        st.skip('当前环境不支持该注入方式，跳过该用例');
         return;
       }
       const dir = freshDir();
@@ -294,7 +369,7 @@ test('此前没有任何意见时保存失败：列表仍成功返回空数组�
         assert.equal(emptyBefore.status, 200);
         assert.deepEqual(emptyBefore.data, { ideas: [] });
 
-        blocker.enable(dir, tmpFile);
+        blocker.enable(dir, file, tmpFile);
         const failed = await postIdea(server, NEW_IDEA);
         assertSaveFailureResponse(failed);
 
@@ -305,11 +380,13 @@ test('此前没有任何意见时保存失败：列表仍成功返回空数组�
         assert.equal(readFileSync(file, 'utf8'), '[]\n', '失败后初始空数据被改写');
         if (blocker.tmpExpectation === 'absent') {
           assert.equal(existsSync(tmpFile), false);
+        } else if (blocker.tmpExpectation === 'leftover-file') {
+          assert.ok(existsSync(tmpFile) && lstatSync(tmpFile).isFile());
         } else {
           assert.ok(lstatSync(tmpFile).isDirectory());
         }
 
-        blocker.disable(dir, tmpFile);
+        blocker.disable(dir, file, tmpFile);
         const retried = await postIdea(server, NEW_IDEA);
         assert.equal(retried.status, 201);
         assert.ok(isCompleteSavedIdea(retried.data.idea));
@@ -318,7 +395,7 @@ test('此前没有任何意见时保存失败：列表仍成功返回空数组�
         assert.equal(listed.data.ideas.length, 1);
         assert.deepEqual(listed.data.ideas[0], retried.data.idea);
       } finally {
-        restoreBlocker(blocker, dir, tmpFile);
+        restoreBlocker(blocker, dir, file, tmpFile);
         await safeStop(server);
         rmSync(dir, { recursive: true, force: true });
       }

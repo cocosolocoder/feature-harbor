@@ -1,6 +1,6 @@
 import { createServer } from 'node:http';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import {
@@ -336,7 +336,20 @@ function readIdeas(): unknown[] {
 function saveIdeas(records: unknown[]): void {
   const tempFile = `${dataFile}.tmp`;
   writeFileSync(tempFile, `${JSON.stringify(records, null, 2)}\n`);
-  renameSync(tempFile, dataFile);
+  try {
+    renameSync(tempFile, dataFile);
+  } catch (error) {
+    // 临时内容已写入但替换正式文件失败：尽量删除本次写出的临时普通文件，
+    // 不让未保存成功的内容留下可被误认成已保存数据的副本。
+    // 清理只针对普通文件——临时路径若是目录等本就不是本次写出的形态，一律不动；
+    // 清理本身失败（如权限限制）只放弃清理，不掩盖原有的保存失败。
+    try {
+      if (lstatSync(tempFile).isFile()) unlinkSync(tempFile);
+    } catch {
+      // 忽略清理异常：保存失败的结果不变
+    }
+    throw error;
+  }
 }
 async function handleCreateIdea(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const chunks: Buffer[] = [];
