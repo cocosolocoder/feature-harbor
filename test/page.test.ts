@@ -140,6 +140,7 @@ function makeIdea(partial: Record<string, unknown> = {}): Record<string, unknown
 const SUCCESS_TEXT = '提交成功，你的意见已保存。';
 const EMPTY_TEXT = '还没有意见记录。';
 const LOAD_FAILED_TEXT = '意见列表加载失败，请稍后刷新重试。';
+const NO_MATCH_TEXT = '没有找到符合关键词的意见。';
 const NETWORK_ERROR_TEXT = '网络错误，提交未成功，请重试。';
 const SUBMIT_FAILED_TEXT = '提交失败，请稍后重试。';
 
@@ -171,6 +172,8 @@ class Harness {
     register('success', 'p', true);
     register('empty', 'p', true);
     register('ideas', 'div');
+    register('search-form', 'form');
+    register('search-input', 'input');
     form.reset = (): void => {
       titleInput.value = '';
       descInput.value = '';
@@ -218,6 +221,13 @@ class Harness {
   submit(): Promise<unknown> {
     const handler = this.els['idea-form'].listeners.submit[0];
     return handler({ preventDefault(): void {} });
+  }
+
+  // 模拟用户输入关键词并执行搜索：写入搜索框并触发搜索表单提交（监听器为同步函数）
+  search(keyword: string): void {
+    this.els['search-input'].value = keyword;
+    const handler = this.els['search-form'].listeners.submit[0];
+    handler({ preventDefault(): void {} });
   }
 
   articles(): El[] {
@@ -1995,4 +2005,283 @@ test('特殊文字意见与普通意见混排：相邻记录与排列不受影�
   assertArticleMatches(articles[2], markup);
   assertArticleMatches(articles[3], plainB);
   assertPlainTextOnly(h);
+});
+
+// 首页关键词搜索回归。搜索只影响首页当前看到的列表：在已知的完整列表（首次响应与本页
+// 已确认保存的意见合并去重后的结果）上按关键词过滤，不提交意见、不重新拉取列表、
+// 不改写已保存记录与提交表单。匹配规则：关键词去首尾空白后，标题、详细说明或使用场景
+// 任一字段包含这段文字即符合，英文不区分大小写；内部空格按原文参与比较，标点、尖括号
+// 与类似正则表达式的文字都按普通文字查找。这些用例要能发现：把关键词发给服务端、
+// 用正则匹配、按词拆分、区分大小写、过滤时改动记录或排列、空关键词不恢复完整列表、
+// 把“没有意见”与“没有匹配结果”混为一谈、加载失败显示成搜索无结果。
+
+// 布置一批内容各异的已有意见，供搜索用例使用
+function seedSearchIdeas(): Record<string, unknown>[] {
+  return [
+    makeIdea({ id: 'r1', title: '支持深色模式', description: '希望界面支持 Dark Mode。', scenario: '夜间使用' }),
+    makeIdea({ id: 'r2', title: '导出数据', description: '需要导出 CSV 文件。', scenario: '月末统计' }),
+    makeIdea({ id: 'r3', title: '移动端适配', description: '手机上排版错乱。', scenario: '户外 Dark 环境查看' }),
+  ];
+}
+
+test('关键词搜索：标题、详细说明或使用场景任一字段包含关键词即符合，结果沿用原有排列', async () => {
+  const h = new Harness(pageScript);
+  const ideas = seedSearchIdeas();
+  h.gets[0].resolve(jsonResponse(200, { ideas }));
+  await flush();
+
+  // 命中标题
+  h.search('深色');
+  assert.deepEqual(h.titles(), ['支持深色模式']);
+  // 命中详细说明（r1 与 r3 的说明/场景分别含 Dark，英文不区分大小写）
+  h.search('dark');
+  assert.deepEqual(h.titles(), ['支持深色模式', '移动端适配']);
+  // 只命中使用场景
+  h.search('月末');
+  assert.deepEqual(h.titles(), ['导出数据']);
+  // 搜索不发出任何请求：不重新拉取列表，也不提交意见
+  assert.equal(h.getsIssued, 1);
+  assert.equal(h.postsIssued, 0);
+  // 有匹配结果时不显示空列表或加载失败提示
+  assert.equal(h.els.empty.hidden, true);
+});
+
+test('关键词去首尾空白后参与匹配；内部空格按原文比较，不拆成多个词', async () => {
+  const h = new Harness(pageScript);
+  const ideas = [
+    makeIdea({ id: 'r1', title: '深色 模式', description: '说明一' }),
+    makeIdea({ id: 'r2', title: '深色  模式', description: '说明二' }),
+    makeIdea({ id: 'r3', title: '深色模式', description: '说明三' }),
+  ];
+  h.gets[0].resolve(jsonResponse(200, { ideas }));
+  await flush();
+
+  // 首尾空白不参与匹配：“  深色  ” 与 “深色” 结果相同
+  h.search('  深色  ');
+  assert.deepEqual(h.titles(), ['深色 模式', '深色  模式', '深色模式']);
+  // 内部单个空格按原文参与：只命中同样含单个空格的记录，不拆成“深色”“模式”两个词
+  h.search('深色 模式');
+  assert.deepEqual(h.titles(), ['深色 模式']);
+  // 内部两个空格只命中含两个空格的记录
+  h.search('深色  模式');
+  assert.deepEqual(h.titles(), ['深色  模式']);
+});
+
+test('标点、尖括号与类似正则表达式的关键词按普通文字查找，展示仍是原文', async () => {
+  const h = new Harness(pageScript);
+  const markup = makeIdea({ id: 'r1', title: '建议 <b>重点</b> 支持', description: '含 <script>alert("x")</script> 样文本', scenario: '' });
+  const regexLike = makeIdea({ id: 'r2', title: '正则示例', description: '写法 a.*b 与 ^开头$', scenario: '' });
+  const plain = makeIdea({ id: 'r3', title: '普通意见', description: '普通说明' });
+  h.gets[0].resolve(jsonResponse(200, { ideas: [markup, regexLike, plain] }));
+  await flush();
+
+  // 尖括号按普通文字匹配：命中含 “<b>” 原文的记录
+  h.search('<b>');
+  assert.deepEqual(h.titles(), ['建议 <b>重点</b> 支持']);
+  // 类似正则的文字按普通文字查找：“.*” 只命中字面包含它的记录，不匹配所有记录
+  h.search('.*');
+  assert.deepEqual(h.titles(), ['正则示例']);
+  h.search('^开头$');
+  assert.deepEqual(h.titles(), ['正则示例']);
+  // 匹配结果展示原文：空白、换行与标记样内容逐字保留，不因搜索删改
+  const articles = h.articles();
+  assert.equal(articles.length, 1);
+  assertArticleMatches(articles[0], regexLike);
+  assertPlainTextOnly(h);
+});
+
+test('关键词为空或只有空白时执行搜索：恢复当前已知的完整列表，沿用原来的顺序', async () => {
+  const h = new Harness(pageScript);
+  const ideas = seedSearchIdeas();
+  h.gets[0].resolve(jsonResponse(200, { ideas }));
+  await flush();
+
+  h.search('深色');
+  assert.deepEqual(h.titles(), ['支持深色模式']);
+
+  // 清空关键词后恢复完整列表
+  h.search('');
+  assert.deepEqual(h.titles(), ['支持深色模式', '导出数据', '移动端适配']);
+
+  // 纯空白关键词同样恢复完整列表
+  h.search('月末');
+  assert.deepEqual(h.titles(), ['导出数据']);
+  h.search('   ');
+  assert.deepEqual(h.titles(), ['支持深色模式', '导出数据', '移动端适配']);
+  // 恢复后每条记录字段完整对应，未被搜索改写
+  const articles = h.articles();
+  assert.equal(articles.length, 3);
+  ideas.forEach((idea, index) => assertArticleMatches(articles[index], idea));
+});
+
+test('空列表状态区分：没有意见显示原有提示，有意见但搜索无结果显示未找到提示', async () => {
+  // 首次加载成功且完整列表为空：保留“还没有意见记录”，即使执行过搜索
+  const empty = new Harness(pageScript);
+  empty.gets[0].resolve(jsonResponse(200, { ideas: [] }));
+  await flush();
+  empty.search('任意关键词');
+  assert.equal(empty.els.empty.hidden, false);
+  assert.equal(empty.els.empty.textContent, EMPTY_TEXT);
+
+  // 已有意见但关键词没有命中：显示明确的未找到提示，不显示“还没有意见记录”
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: seedSearchIdeas() }));
+  await flush();
+  h.search('不存在的关键词');
+  assert.equal(h.articles().length, 0);
+  assert.equal(h.els.empty.hidden, false);
+  assert.equal(h.els.empty.textContent, NO_MATCH_TEXT);
+
+  // 用户仍可修改关键词：改成有命中的词即看到结果；清空后恢复完整列表与提示
+  h.search('深色');
+  assert.deepEqual(h.titles(), ['支持深色模式']);
+  assert.equal(h.els.empty.hidden, true);
+  h.search('');
+  assert.equal(h.articles().length, 3);
+  assert.equal(h.els.empty.hidden, true);
+});
+
+test('首次列表尚未返回时执行搜索：不能提前断言没有匹配结果；迟到返回后按已生效的关键词更新可见结果', async () => {
+  const h = new Harness(pageScript);
+  // 列表仍在加载：执行搜索不显示任何空态提示（既不是没有意见，也不是没有匹配）
+  h.search('深色');
+  assert.equal(h.els.empty.hidden, true);
+  assert.equal(h.articles().length, 0);
+
+  // 首次列表迟到返回：按已生效的关键词过滤更新
+  h.gets[0].resolve(jsonResponse(200, { ideas: seedSearchIdeas() }));
+  await flush();
+  assert.deepEqual(h.titles(), ['支持深色模式']);
+  assert.equal(h.els.empty.hidden, true);
+
+  // 清空关键词后看到完整列表
+  h.search('');
+  assert.deepEqual(h.titles(), ['支持深色模式', '导出数据', '移动端适配']);
+});
+
+test('首次列表加载失败：继续显示加载失败提示，搜索不能把失败显示成无结果', async () => {
+  const h = new Harness(pageScript);
+  h.gets[0].reject(new TypeError('Failed to fetch'));
+  await flush();
+  assert.equal(h.els.empty.textContent, LOAD_FAILED_TEXT);
+
+  h.search('任意关键词');
+  assert.equal(h.els.empty.hidden, false);
+  assert.equal(h.els.empty.textContent, LOAD_FAILED_TEXT);
+  h.search('');
+  assert.equal(h.els.empty.textContent, LOAD_FAILED_TEXT);
+});
+
+test('搜索生效后本页提交的新意见：符合条件的按原有顺序出现在结果中，不符合的仍作为已保存意见保留', async () => {
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: seedSearchIdeas() }));
+  await flush();
+  h.search('深色');
+  assert.deepEqual(h.titles(), ['支持深色模式']);
+
+  // 提交一条符合关键词的意见：确认保存后按原有排列规则出现在结果最前
+  const matching = makeIdea({ id: 'a', title: '深色模式自动切换', description: '跟随系统' });
+  h.setForm({ title: '深色模式自动切换', description: '跟随系统' });
+  const first = h.submit();
+  h.posts[0].resolve(jsonResponse(201, { idea: matching }));
+  await first;
+  await flush();
+  assert.deepEqual(h.titles(), ['深色模式自动切换', '支持深色模式']);
+  assert.equal(h.els.success.hidden, false);
+  assert.equal(h.els.success.textContent, SUCCESS_TEXT);
+
+  // 提交一条不符合关键词的意见：同样确认保存、显示成功提示，只是暂时不在搜索结果中可见
+  const other = makeIdea({ id: 'b', title: '增加快捷键', description: '键盘操作' });
+  h.setForm({ title: '增加快捷键', description: '键盘操作' });
+  const second = h.submit();
+  h.posts[1].resolve(jsonResponse(201, { idea: other }));
+  await second;
+  await flush();
+  assert.equal(h.els.success.hidden, false);
+  assert.equal(h.els.success.textContent, SUCCESS_TEXT);
+  assert.equal(h.els.error.hidden, true);
+  assert.deepEqual(h.titles(), ['深色模式自动切换', '支持深色模式']);
+
+  // 恢复完整列表后两条新意见都在，按原有规则排在最前
+  h.search('');
+  assert.deepEqual(h.titles(), ['增加快捷键', '深色模式自动切换', '支持深色模式', '导出数据', '移动端适配']);
+});
+
+test('搜索不提交意见、不清空或改写提交表单中的草稿：填写意见和搜索列表可以独立进行', async () => {
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: seedSearchIdeas() }));
+  await flush();
+
+  // 正在填写的草稿不受搜索影响
+  h.edit('f-title', '正在写的标题');
+  h.edit('f-desc', '正在写的说明');
+  h.edit('f-scenario', '正在写的场景');
+  h.search('深色');
+  assert.deepEqual(h.titles(), ['支持深色模式']);
+  assert.equal(h.postsIssued, 0);
+  assert.equal(h.els['f-title'].value, '正在写的标题');
+  assert.equal(h.els['f-desc'].value, '正在写的说明');
+  assert.equal(h.els['f-scenario'].value, '正在写的场景');
+
+  // 搜索生效后照常提交：字段校验、成功提示与保存后的表单处理保持现有行为
+  const submitted = h.submit();
+  assert.equal(h.postsIssued, 1);
+  assert.deepEqual(JSON.parse(h.postBodies[0] as string), {
+    title: '正在写的标题',
+    description: '正在写的说明',
+    scenario: '正在写的场景',
+  });
+  const saved = makeIdea({ id: 'a', title: '正在写的标题', description: '正在写的说明', scenario: '正在写的场景' });
+  h.posts[0].resolve(jsonResponse(201, { idea: saved }));
+  await submitted;
+  await flush();
+  assert.equal(h.els.success.hidden, false);
+  assert.equal(h.els.success.textContent, SUCCESS_TEXT);
+  assert.equal(h.els['f-title'].value, '');
+  assert.equal(h.els['f-desc'].value, '');
+  assert.equal(h.els['f-scenario'].value, '');
+  // 新意见不符合当前关键词：暂时不可见，但已保存；清空关键词后按原有顺序出现
+  assert.deepEqual(h.titles(), ['支持深色模式']);
+  h.search('');
+  assert.deepEqual(h.titles(), ['正在写的标题', '支持深色模式', '导出数据', '移动端适配']);
+});
+
+test('搜索生效后提交前的字段校验失败提示保持现有行为，搜索状态不受影响', async () => {
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: seedSearchIdeas() }));
+  await flush();
+  h.search('深色');
+
+  h.setForm({ title: '   ', description: '有效说明' });
+  await h.submit();
+  assert.equal(h.postsIssued, 0);
+  assert.equal(h.els.error.hidden, false);
+  assert.equal(h.els.error.textContent, '标题不能为空。');
+  // 搜索过滤仍然生效
+  assert.deepEqual(h.titles(), ['支持深色模式']);
+});
+
+test('同一条意见在搜索结果中只显示一次；内容相同但标识不同的记录在搜索下分别保留', async () => {
+  const h = new Harness(pageScript);
+  const mine = makeIdea({ id: 'a', title: '深色模式建议', description: '本页提交的说明' });
+  h.setForm({ title: '深色模式建议', description: '本页提交的说明' });
+  const submitted = h.submit();
+  h.posts[0].resolve(jsonResponse(201, { idea: mine }));
+  await submitted;
+
+  // 迟到的首次列表携带同一条的重复拷贝，另有两条同文不同 id 的记录
+  const staleCopy = makeIdea({ id: 'a', title: '列表里的重复拷贝' });
+  const dup1 = makeIdea({ id: 'x', title: '深色模式', description: '同样的说明' });
+  const dup2 = makeIdea({ id: 'y', title: '深色模式', description: '同样的说明' });
+  h.gets[0].resolve(jsonResponse(200, { ideas: [staleCopy, dup1, dup2] }));
+  await flush();
+
+  h.search('深色');
+  // id=a 只显示一次（保留提交确认的那条）；同文不同 id 的两条分别保留
+  assert.deepEqual(h.titles(), ['深色模式建议', '深色模式', '深色模式']);
+  const articles = h.articles();
+  assert.equal(articles.length, 3);
+  assertArticleMatches(articles[0], mine);
+  assertArticleMatches(articles[1], dup1);
+  assertArticleMatches(articles[2], dup2);
 });

@@ -51,6 +51,11 @@ time{color:#666;font-size:.9rem}
 <p id="success" role="status" hidden></p>
 </form>
 <h2>意见列表</h2>
+<form id="search-form" novalidate>
+<label for="search-input">搜索意见（标题、详细说明或使用场景包含关键词即符合，英文不区分大小写）</label>
+<input id="search-input" name="keyword" type="search">
+<button type="submit">搜索</button>
+</form>
 <p id="empty" hidden>还没有意见记录。</p>
 <div id="ideas"></div>
 <p><a href="/api/ideas">查看意见列表接口</a> · <a href="/health">服务状态</a></p>
@@ -64,8 +69,11 @@ const errorBox = document.getElementById('error');
 const successBox = document.getElementById('success');
 const emptyNote = document.getElementById('empty');
 const list = document.getElementById('ideas');
+const searchForm = document.getElementById('search-form');
+const searchInput = document.getElementById('search-input');
 const EMPTY_TEXT = '还没有意见记录。';
 const LOAD_FAILED_TEXT = '意见列表加载失败，请稍后刷新重试。';
+const NO_MATCH_TEXT = '没有找到符合关键词的意见。';
 // 首次列表请求的状态：loading（进行中）/ ready（成功）/ failed（失败）
 let listState = 'loading';
 function showError(message) {
@@ -103,6 +111,18 @@ let remoteIdeas = [];
 // 本页已确认保存的意见，按本页发起提交的先后排列：后提交的在前。
 // 每条记录带上点击提交时的序号，响应返回的先后不影响排列位置
 const submittedIdeas = [];
+// 当前生效的搜索关键词：执行搜索时去掉输入首尾空白后的整段文字；
+// 空字符串表示不过滤，展示当前已知的完整列表
+let activeKeyword = '';
+// 关键词按普通文字做包含匹配：标题、详细说明或使用场景任一字段包含这段文字即符合，
+// 英文不区分大小写；关键词内部空格按原文参与比较（不拆成多个词），
+// 标点、尖括号与类似正则表达式的文字都按普通文字查找（用 includes，不构造正则）
+function matchesKeyword(idea, keyword) {
+  const needle = keyword.toLowerCase();
+  return idea.title.toLowerCase().includes(needle)
+    || idea.description.toLowerCase().includes(needle)
+    || idea.scenario.toLowerCase().includes(needle);
+}
 function renderList() {
   // 以服务端标识 id 去重后合并：本页提交成功的意见在前，其后补入首次响应中的其他记录
   const seen = new Set();
@@ -114,18 +134,38 @@ function renderList() {
   for (const idea of remoteIdeas) {
     if (!seen.has(idea.id)) { seen.add(idea.id); ordered.push(idea); }
   }
-  list.replaceChildren(...ordered.map(renderIdea));
+  // 搜索只影响当前看到的列表：按生效中的关键词过滤，排列规则与去重结果不变，
+  // 已保存的记录本身不增不改
+  const visible = activeKeyword === '' ? ordered : ordered.filter((idea) => matchesKeyword(idea, activeKeyword));
+  list.replaceChildren(...visible.map(renderIdea));
   if (listState === 'failed') {
     emptyNote.textContent = LOAD_FAILED_TEXT;
     emptyNote.hidden = false;
   } else if (listState === 'ready') {
-    emptyNote.textContent = EMPTY_TEXT;
-    emptyNote.hidden = ordered.length > 0;
+    if (ordered.length === 0) {
+      // 首次加载已成功且完整列表为空：没有意见，与搜索无关
+      emptyNote.textContent = EMPTY_TEXT;
+      emptyNote.hidden = false;
+    } else if (visible.length === 0) {
+      // 有意见但当前关键词没有命中：明确区分于“还没有意见记录”
+      emptyNote.textContent = NO_MATCH_TEXT;
+      emptyNote.hidden = false;
+    } else {
+      emptyNote.hidden = true;
+    }
   } else {
-    // 首次列表仍在加载，不能把等待误报成没有记录
+    // 首次列表仍在加载，不能把等待误报成没有记录或没有匹配结果
     emptyNote.hidden = true;
   }
 }
+// 执行搜索只更新当前列表的可见范围：不提交意见、不重新拉取列表、
+// 不清空或改写提交表单中的草稿，也不改动成功/失败提示
+searchForm.addEventListener('submit', (event) => {
+  event.preventDefault();
+  // 关键词为空或只有空白：恢复当前已知的完整列表，沿用原来的顺序
+  activeKeyword = searchInput.value.trim();
+  renderList();
+});
 // 一条意见记录是否完整，直接使用 idea-fields.ts 注入的同一份 isCompleteIdea：
 // 与服务读取已有数据的判定逐字相同，列表加载与提交确认都调用它，不在页面另写第二份。
 async function loadIdeas() {

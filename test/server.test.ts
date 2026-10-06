@@ -34,6 +34,8 @@ test('GET / 返回首页：含提交表单、三个字段、空列表提示与�
     'id="f-title"',
     'id="f-desc"',
     'id="f-scenario"',
+    '<form id="search-form"',
+    'id="search-input"',
     'id="ideas"',
     '还没有意见记录。',
     "fetch('/api/ideas')",
