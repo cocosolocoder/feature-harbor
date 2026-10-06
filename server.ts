@@ -352,16 +352,28 @@ function saveIdeas(records: unknown[]): void {
   }
 }
 async function handleCreateIdea(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  // 大小限制按实际收到的正文逐块累计字节：JSON 的括号、引号、字段名与空白都计入，
+  // chunked 分块的编码开销由 Node 解开后不计入；中文、表情按 UTF-8 字节累计。
+  // 这与标题等字段按 Unicode 码点计算的上限是两套独立规则。
   const chunks: Buffer[] = [];
   let size = 0;
+  let tooLarge = false;
   for await (const chunk of req as AsyncIterable<Buffer>) {
     size += chunk.length;
     if (size > MAX_BODY_BYTES) {
-      respond(res, 400, { error: '请求体过大' });
-      req.destroy();
-      return;
+      // 已确认超大：上限之上的字节不再缓存，绝不截断正文后继续解析或尝试保存。
+      // 但要继续读完整个请求而不是 destroy 连接——客户端可能还在发送，立即断连会让它
+      // 只看到连接重置（ECONNRESET），读不到下面这条完整、带 Content-Length 的 400 响应。
+      tooLarge = true;
+      continue;
     }
     chunks.push(chunk);
+  }
+  if (tooLarge) {
+    // 超大拒绝优先于一切内容判定：即使正文同时不是合法 JSON 或字段有问题，
+    // 理由也必须是“请求体过大”，不能被后续解析替换成别的错误。
+    respond(res, 400, { error: '请求体过大' });
+    return;
   }
   let payload: unknown;
   try {
