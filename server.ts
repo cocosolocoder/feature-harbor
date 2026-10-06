@@ -1,6 +1,6 @@
 import { createServer } from 'node:http';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import {
@@ -335,8 +335,22 @@ function readIdeas(): unknown[] {
 }
 function saveIdeas(records: unknown[]): void {
   const tempFile = `${dataFile}.tmp`;
-  writeFileSync(tempFile, `${JSON.stringify(records, null, 2)}\n`);
-  renameSync(tempFile, dataFile);
+  try {
+    writeFileSync(tempFile, `${JSON.stringify(records, null, 2)}\n`);
+    renameSync(tempFile, dataFile);
+  } catch (error) {
+    // 保存失败时清理本次可能写出的临时普通文件，不让未保存成功的内容
+    // 以临时文件形式留在保存目录里被误认成已保存数据。
+    // 只删除普通文件：临时文件位置被目录占用时（写入以 EISDIR 失败）
+    // 那个目录及其中内容必须原样保留；临时文件根本不存在或没有写出时无需处理。
+    // 清理本身失败（如权限限制）不能改变原有的保存失败结果，也不能中断响应。
+    try {
+      if (lstatSync(tempFile).isFile()) unlinkSync(tempFile);
+    } catch {
+      // 忽略清理异常：保存失败的结果不变，正式意见数据不受影响。
+    }
+    throw error;
+  }
 }
 async function handleCreateIdea(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const chunks: Buffer[] = [];
