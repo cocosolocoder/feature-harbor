@@ -2344,3 +2344,257 @@ test('搜索：列表中的意见始终展示原文，空白与换行保留，�
   assertArticleMatches(h.articles()[0], markup);
   assertPlainTextOnly(h);
 });
+
+// 读取兼容回归（首页侧）：已经保存的意见只要记录结构完整，首页首次加载就必须继续按原文显示，
+// 不能因为内容不符合「现在」的提交限制（标题去空白后非空且最多 120 码点、详细说明含非空白
+// 内容且最多 5000 码点、使用场景最多 1000 码点）而整次加载失败、跳过这些记录，或只显示混排
+// 在其中的普通意见。内容校验只约束新提交；结构判定（isCompleteIdea）也不能为此放宽。
+const LEGACY_LIMITS = { title: 120, description: 5000, scenario: 1000 };
+
+// 一组按今天的规则已无法新提交、但结构完整的历史记录，中间夹一条普通意见
+function legacyRecords(): Array<Record<string, unknown>> {
+  return [
+    makeIdea({
+      id: 'legacy-1',
+      title: '  ' + repeatCp('长', LEGACY_LIMITS.title + 1) + ' ',
+      description: '标题超限历史正文\n第二行保留换行与中文😀',
+      scenario: '标题超限记录的场景',
+      createdAt: '2020-01-01T00:00:00.000Z',
+    }),
+    makeIdea({
+      id: 'legacy-2',
+      title: '正文超限的历史意见',
+      description: repeatCp('描', LEGACY_LIMITS.description) + '😀',
+      scenario: '',
+      createdAt: '2020-02-02T00:02:00.000Z',
+    }),
+    makeIdea({
+      id: 'legacy-3',
+      title: '  场景超限且标题首尾空白保留  ',
+      description: '场景超限历史正文',
+      scenario: repeatCp('景', LEGACY_LIMITS.scenario + 1),
+      createdAt: '2020-03-03T00:03:00.000Z',
+    }),
+    makeIdea({
+      // 混在特殊记录中间的普通意见：不能变成只显示这一条
+      id: 'legacy-4',
+      title: '混排在其中的普通意见',
+      description: '完全符合当前规则的普通正文',
+      scenario: '',
+      createdAt: '2020-04-04T00:04:00.000Z',
+    }),
+    makeIdea({
+      id: 'legacy-5',
+      title: '  \t\n ',
+      description: '标题只有空白的历史正文，不能替换成默认标题',
+      scenario: '空白标题记录的场景',
+      createdAt: '2020-05-05T00:05:00.000Z',
+    }),
+    makeIdea({
+      id: 'legacy-6',
+      title: '正文只有空白的历史意见',
+      description: '  \n\t  ',
+      scenario: '',
+      createdAt: '2020-06-06T00:06:00.000Z',
+    }),
+    makeIdea({
+      id: 'legacy-7',
+      title: '  建议 <b>重点</b> 支持深色模式 😀  ',
+      description: [
+        '正文第一行保留换行',
+        '脚本样文本 <script>alert("x")</script> 与实体原文 &lt;div&gt; &amp;',
+        '',
+        '末行含中文、表情与空白  😀  ',
+      ].join('\n'),
+      scenario: '',
+      createdAt: 'not-a-date-but-a-string',
+    }),
+    makeIdea({
+      id: 'legacy-8',
+      title: '',
+      description: '标题为空字符串的历史正文',
+      scenario: '空标题记录的场景',
+      createdAt: '2020-08-08T00:08:00.000Z',
+    }),
+    makeIdea({
+      id: 'legacy-9',
+      title: '正文为空字符串的历史意见',
+      description: '',
+      scenario: '空正文记录的场景\n第二行换行保留',
+      createdAt: '2020-09-09T00:09:00.000Z',
+    }),
+  ];
+}
+
+test('首次加载：超限或空白的历史记录全部按原文显示，不加载失败、不跳过、不只显示普通意见、不截断、不替换默认文字', async () => {
+  const legacy = legacyRecords();
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: legacy }));
+  await flush();
+
+  // 不出现“意见列表加载失败”或“还没有意见记录”的提示（empty 节点保持隐藏）
+  assert.equal(h.els.empty.hidden, true);
+  assert.equal(h.els.error.hidden, true);
+  assert.equal(h.getsIssued, 1, '首次加载只发起一次列表请求');
+  assert.equal(h.postsIssued, 0);
+
+  // 特殊记录一条都不能少，顺序与接口返回一致
+  const articles = h.articles();
+  assert.equal(articles.length, legacy.length);
+  assert.deepEqual(h.titles(), legacy.map((idea) => idea.title));
+  for (const [i, idea] of legacy.entries()) assertArticleMatches(articles[i], idea);
+
+  // 长内容完整保留，不截断到当前上限；首尾空白也在
+  const overTitleHeading = articles[0].children.find((n) => n.tagName === 'H3')!;
+  assert.equal(codePointCount(overTitleHeading.textContent), LEGACY_LIMITS.title + 1 + 3);
+  assert.ok(overTitleHeading.textContent.startsWith('  '));
+  assert.ok(overTitleHeading.textContent.endsWith(' '));
+  const overDescText = articles[1].children.find((n) => n.tagName === 'P' && n.children.length === 0)!;
+  assert.equal(codePointCount(overDescText.textContent), LEGACY_LIMITS.description + 1);
+  assert.ok(overDescText.textContent.endsWith('😀'));
+  const overScenarioSpan = findScenario(articles[2])!.children.find((n) => n.tagName === 'SPAN')!;
+  assert.equal(codePointCount(overScenarioSpan.textContent), LEGACY_LIMITS.scenario + 1);
+
+  // 空白内容按原文渲染，不能被替换成默认文字（空字符串与纯空白各自保留）
+  assert.equal(articles[4].children.find((n) => n.tagName === 'H3')!.textContent, '  \t\n ');
+  assert.equal(articles[5].children.find((n) => n.tagName === 'P' && n.children.length === 0)!.textContent, '  \n\t  ');
+  assert.equal(articles[7].children.find((n) => n.tagName === 'H3')!.textContent, '');
+  assert.equal(articles[8].children.find((n) => n.tagName === 'P' && n.children.length === 0)!.textContent, '');
+
+  // scenario 为空字符串的记录一律不渲染“使用场景”段
+  for (const index of [1, 3, 5, 6]) assert.equal(findScenario(articles[index]), undefined);
+});
+
+test('首次加载：历史标题首尾空白、说明与场景中的换行、中文和表情保留；尖括号与网页标记样文字按普通文字展示', async () => {
+  const legacy = legacyRecords();
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: legacy }));
+  await flush();
+
+  const markup = h.articles()[6];
+  const heading = markup.children.find((n) => n.tagName === 'H3')!;
+  // 首尾空白与尖括号逐字保留：不能只剩“重点”，也不能变成加粗元素
+  assert.equal(heading.textContent, '  建议 <b>重点</b> 支持深色模式 😀  ');
+  assert.ok(heading.textContent.includes('<b>重点</b>'));
+  assert.equal(heading.children.length, 0);
+  const desc = markup.children.find((n) => n.tagName === 'P' && n.children.length === 0)!;
+  assert.ok(desc.textContent.includes('<script>alert("x")</script>'));
+  assert.ok(desc.textContent.includes('&lt;div&gt; &amp;'));
+  assert.ok(desc.textContent.includes('\n\n'));
+  assert.equal(desc.children.length, 0);
+  // 不能解析为日期的历史时间字符串也按原文放在 time 上
+  const time = markup.children.find((n) => n.tagName === 'TIME')!;
+  assert.equal(time.dateTime, 'not-a-date-but-a-string');
+  assertPlainTextOnly(h);
+});
+
+test('使用场景为空字符串继续省略场景段落；它与缺失场景字段不是同一种情况：缺字段整次加载失败', async () => {
+  // 空字符串 scenario：正常记录，加载成功且没有场景段
+  const ok = makeIdea({ id: 'r1', title: '空场景历史意见', description: '正文', scenario: '' });
+  const h1 = new Harness(pageScript);
+  h1.gets[0].resolve(jsonResponse(200, { ideas: [ok] }));
+  await flush();
+  assert.equal(h1.els.empty.hidden, true);
+  assert.equal(h1.articles().length, 1);
+  assert.equal(findScenario(h1.articles()[0]), undefined);
+
+  // 缺少 scenario 字段（即使与正常记录、超限记录混排）：整次加载失败，不部分展示
+  const withoutScenario = makeIdea({ id: 'r2', title: '缺场景字段', description: '正文' });
+  delete (withoutScenario as Record<string, unknown>).scenario;
+  const overLimit = makeIdea({
+    id: 'r3',
+    title: repeatCp('长', LEGACY_LIMITS.title + 1),
+    description: '结构完整但标题超限的历史记录',
+  });
+  const h2 = new Harness(pageScript);
+  h2.gets[0].resolve(jsonResponse(200, { ideas: [overLimit, withoutScenario, ok] }));
+  await flush();
+  assert.equal(h2.els.empty.hidden, false);
+  assert.equal(h2.els.empty.textContent, LOAD_FAILED_TEXT);
+  assert.equal(h2.articles().length, 0, '不能只展示结构完整的部分');
+});
+
+test('读入历史记录后提交符合当前规则的新意见：成功并排最前，旧记录的内容、标识、时间与相对次序保持不变', async () => {
+  const legacy = legacyRecords();
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: legacy }));
+  await flush();
+
+  h.setForm({ title: '兼容旧内容后的新意见', description: '符合当前规则的新说明', scenario: '新场景' });
+  const submitted = h.submit();
+  assert.equal(h.postsIssued, 1);
+  const mine = makeIdea({ id: 'new-1', title: '兼容旧内容后的新意见', description: '符合当前规则的新说明', scenario: '新场景' });
+  h.posts[0].resolve(jsonResponse(201, { idea: mine }));
+  await submitted;
+  await flush();
+
+  assert.equal(h.els.success.hidden, false);
+  assert.equal(h.els.success.textContent, SUCCESS_TEXT);
+  assert.equal(h.els.error.hidden, true);
+
+  const articles = h.articles();
+  assert.equal(articles.length, legacy.length + 1);
+  assertArticleMatches(articles[0], mine);
+  for (const [i, idea] of legacy.entries()) assertArticleMatches(articles[i + 1], idea);
+  assert.deepEqual(h.titles(), [mine.title, ...legacy.map((idea) => idea.title)]);
+});
+
+test('新旧内容区别保留：首页表单对超限或空白的新内容仍按当前规则拦截，已加载的历史记录数量、顺序与内容不变', async (t) => {
+  const cases = [
+    { name: '标题超限', values: { title: repeatCp('中', LEGACY_LIMITS.title + 1), description: '说明', scenario: '场景' }, message: TITLE_LIMIT_ERROR },
+    { name: '详细说明超限', values: { title: '标题', description: repeatCp('中', LEGACY_LIMITS.description + 1), scenario: '场景' }, message: DESC_LIMIT_ERROR },
+    { name: '使用场景超限', values: { title: '标题', description: '说明', scenario: repeatCp('中', LEGACY_LIMITS.scenario + 1) }, message: SCENARIO_LIMIT_ERROR },
+    { name: '标题只有空白', values: { title: '  \t\n ', description: '说明', scenario: '场景' }, message: '标题不能为空。' },
+    { name: '标题为空字符串', values: { title: '', description: '说明', scenario: '场景' }, message: '标题不能为空。' },
+    { name: '详细说明只有空白', values: { title: '标题', description: '  \n\t  ', scenario: '场景' }, message: '详细说明不能为空。' },
+    { name: '详细说明为空字符串', values: { title: '标题', description: '', scenario: '场景' }, message: '详细说明不能为空。' },
+  ];
+  for (const c of cases) {
+    await t.test(c.name, async () => {
+      const legacy = legacyRecords();
+      const h = new Harness(pageScript);
+      h.gets[0].resolve(jsonResponse(200, { ideas: legacy }));
+      await flush();
+
+      h.setForm(c.values);
+      await h.submit();
+
+      // 新内容校验在发出请求前拦截，历史记录不受影响
+      assert.equal(h.postsIssued, 0, c.name);
+      assert.equal(h.els.error.hidden, false, c.name);
+      assert.equal(h.els.error.textContent, c.message, c.name);
+      assert.equal(h.els.success.hidden, true, c.name);
+      assert.equal(h.articles().length, legacy.length, c.name);
+      assert.deepEqual(h.titles(), legacy.map((idea) => idea.title), c.name);
+    });
+  }
+});
+
+test('结构判定不为接受超限旧内容而放宽：结构完整的超限记录与结构损坏记录混排时整次首页加载失败', async (t) => {
+  const overLimit = (): Record<string, unknown> =>
+    makeIdea({
+      title: repeatCp('长', LEGACY_LIMITS.title + 1),
+      description: repeatCp('描', LEGACY_LIMITS.description + 1),
+      scenario: repeatCp('景', LEGACY_LIMITS.scenario + 1),
+    });
+  const good = (): Record<string, unknown> => makeIdea({ id: 'r1' });
+  const cases = [
+    { name: '混入 null', record: null },
+    { name: '混入缺 title 的记录', record: (() => { const r = good(); delete r.title; return r; })() },
+    { name: '混入缺 scenario 的记录', record: (() => { const r = good(); delete r.scenario; return r; })() },
+    { name: '混入 id 为空字符串的记录', record: { ...good(), id: '' } },
+    { name: '混入 createdAt 为数字的记录', record: { ...good(), createdAt: 1 } },
+  ];
+  for (const c of cases) {
+    await t.test(c.name, async () => {
+      const h = new Harness(pageScript);
+      // 损坏记录夹在两条内容超限但结构完整的历史记录之间，前面还有一条普通记录
+      h.gets[0].resolve(jsonResponse(200, { ideas: [good(), overLimit(), c.record, overLimit()] }));
+      await flush();
+
+      assert.equal(h.els.empty.hidden, false, c.name);
+      assert.equal(h.els.empty.textContent, LOAD_FAILED_TEXT, c.name);
+      assert.equal(h.articles().length, 0, c.name);
+    });
+  }
+});
