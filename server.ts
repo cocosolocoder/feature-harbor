@@ -37,6 +37,9 @@ button{margin-top:1rem;padding:.5rem 1.2rem;font:inherit}
 .idea h3{margin:0 0 .5rem}
 .pre{white-space:pre-wrap}
 time{color:#666;font-size:.9rem}
+#search-form{margin:1rem 0}
+#search-form input{max-width:20rem;margin-right:.5rem}
+#search-form button{margin-top:.25rem;margin-right:.5rem}
 </style><main><h1>FeatureHarbor</h1><p>产品意见与公开路线图</p>
 <h2>提交产品意见</h2>
 <form id="idea-form" novalidate>
@@ -51,6 +54,12 @@ time{color:#666;font-size:.9rem}
 <p id="success" role="status" hidden></p>
 </form>
 <h2>意见列表</h2>
+<form id="search-form" role="search" novalidate>
+<label for="f-search">关键词搜索</label>
+<input id="f-search" name="q" type="search" placeholder="搜索标题、详细说明或使用场景" autocomplete="off">
+<button type="submit">搜索</button>
+<button id="search-clear" type="button">清空</button>
+</form>
 <p id="empty" hidden>还没有意见记录。</p>
 <div id="ideas"></div>
 <p><a href="/api/ideas">查看意见列表接口</a> · <a href="/health">服务状态</a></p>
@@ -64,10 +73,26 @@ const errorBox = document.getElementById('error');
 const successBox = document.getElementById('success');
 const emptyNote = document.getElementById('empty');
 const list = document.getElementById('ideas');
+const searchForm = document.getElementById('search-form');
+const searchInput = document.getElementById('f-search');
+const searchClear = document.getElementById('search-clear');
 const EMPTY_TEXT = '还没有意见记录。';
+const NOT_FOUND_TEXT = '没有找到符合关键词的意见。';
 const LOAD_FAILED_TEXT = '意见列表加载失败，请稍后刷新重试。';
 // 首次列表请求的状态：loading（进行中）/ ready（成功）/ failed（失败）
 let listState = 'loading';
+// 已生效的搜索关键词：去掉首尾空白后的完整一段文字，空字符串表示不搜索。
+// 只影响当前页面的可见结果，不发起请求、不改变已保存记录与接口返回。
+let activeKeyword = '';
+// 纯文字的大小写不敏感包含判断：关键词内部空格按原文参与比较，
+// 不拆词；标点、尖括号与看起来像正则表达式的文字都按普通文字查找，
+// 因此直接用 includes，不能走正则。
+function ideaMatches(idea, keyword) {
+  const needle = keyword.toLowerCase();
+  return idea.title.toLowerCase().includes(needle)
+    || idea.description.toLowerCase().includes(needle)
+    || idea.scenario.toLowerCase().includes(needle);
+}
 function showError(message) {
   errorBox.textContent = message;
   errorBox.hidden = false;
@@ -114,16 +139,26 @@ function renderList() {
   for (const idea of remoteIdeas) {
     if (!seen.has(idea.id)) { seen.add(idea.id); ordered.push(idea); }
   }
-  list.replaceChildren(...ordered.map(renderIdea));
+  // 搜索只过滤当前页面的可见结果：沿用合并后的原有顺序，逐条判断、不去重不重排，
+  // 同一条意见最多出现一次；匹配的意见仍按原文渲染（保留空白与换行），不删改内容。
+  const visible = activeKeyword
+    ? ordered.filter((idea) => ideaMatches(idea, activeKeyword))
+    : ordered;
+  list.replaceChildren(...visible.map(renderIdea));
   if (listState === 'failed') {
+    // 加载失败优先显示现有的失败提示，不能把失败显示成搜索无结果
     emptyNote.textContent = LOAD_FAILED_TEXT;
     emptyNote.hidden = false;
-  } else if (listState === 'ready') {
+  } else if (listState !== 'ready') {
+    // 首次列表仍在加载，不能把等待误报成没有记录或没有匹配结果
+    emptyNote.hidden = true;
+  } else if (activeKeyword) {
+    // 搜索已生效：完整列表是否为空决定提示措辞，已有意见但无匹配时明确提示未找到
+    emptyNote.textContent = ordered.length === 0 ? EMPTY_TEXT : NOT_FOUND_TEXT;
+    emptyNote.hidden = visible.length > 0;
+  } else {
     emptyNote.textContent = EMPTY_TEXT;
     emptyNote.hidden = ordered.length > 0;
-  } else {
-    // 首次列表仍在加载，不能把等待误报成没有记录
-    emptyNote.hidden = true;
   }
 }
 // 一条意见记录是否完整，直接使用 idea-fields.ts 注入的同一份 isCompleteIdea：
@@ -230,6 +265,22 @@ form.addEventListener('submit', async (event) => {
     successBox.textContent = '提交成功，你的意见已保存。';
     successBox.hidden = false;
   }
+});
+// 搜索只在本页过滤已合并的完整列表：提交搜索表单不发起任何请求、不提交意见，
+// 也不清空或改写提交意见表单里的草稿；关键词去掉首尾空白后为空时恢复完整列表。
+// 已生效后，迟到的首次列表与本页新确认保存的意见都会在 renderList 中继续按它过滤。
+function applySearch() {
+  activeKeyword = searchInput.value.trim();
+  renderList();
+}
+searchForm.addEventListener('submit', (event) => {
+  event.preventDefault();
+  applySearch();
+});
+searchClear.addEventListener('click', () => {
+  searchInput.value = '';
+  activeKeyword = '';
+  renderList();
 });
 loadIdeas();
 </script></html>`;
