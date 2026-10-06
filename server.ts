@@ -352,16 +352,39 @@ function saveIdeas(records: unknown[]): void {
   }
 }
 async function handleCreateIdea(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  // 请求大小上限按实际收到的字节累计：JSON 的括号、引号、字段名与空白都计入，
+  // 中文、表情按 UTF-8 编码后的字节数计入；这与字段按 Unicode 码点的上限是两回事。
+  const declaredLength = Number(req.headers['content-length']);
+  let tooLarge = Number.isFinite(declaredLength) && declaredLength > MAX_BODY_BYTES;
   const chunks: Buffer[] = [];
   let size = 0;
-  for await (const chunk of req as AsyncIterable<Buffer>) {
-    size += chunk.length;
-    if (size > MAX_BODY_BYTES) {
-      respond(res, 400, { error: '请求体过大' });
-      req.destroy();
-      return;
+  // 超限后不能写出 400 就立即 req.destroy()：客户端可能还在发送，强断会让它只看到
+  // 连接断开，读不到完整错误。这里继续把请求体读完（排空，天然带背压），
+  // 等请求正常结束后再回复，客户端只要发完并保持连接等待，就能收到完整可解析的 400。
+  // 超限后的字节不再缓存：绝不能拿已收到的前缀去解析，更不能截断后尝试保存。
+  try {
+    for await (const chunk of req as AsyncIterable<Buffer>) {
+      size += chunk.length;
+      if (tooLarge) continue;
+      if (size > MAX_BODY_BYTES) {
+        tooLarge = true;
+        chunks.length = 0;
+        continue;
+      }
+      chunks.push(chunk);
     }
-    chunks.push(chunk);
+  } catch {
+    // 客户端中途断开或请求流出错：响应已无处可写，安静结束，不能变成 500。
+    req.destroy();
+    return;
+  }
+  // 无论是否预先声明长度（Content-Length）还是分段传输（Transfer-Encoding: chunked）、
+  // 超出发生在中途还是末段，都按同一条规则拒绝；即使正文同时不是合法 JSON，
+  // 理由也仍是“请求体过大”，不能被后续的 JSON 解析替换成别的错误。
+  // 恰好达到上限（size === MAX_BODY_BYTES）不在这里拒绝，继续按 JSON 与字段规则判断。
+  if (tooLarge) {
+    respond(res, 400, { error: '请求体过大' });
+    return;
   }
   let payload: unknown;
   try {
