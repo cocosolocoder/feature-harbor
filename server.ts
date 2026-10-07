@@ -27,6 +27,60 @@ const CONTENT_ERROR_MESSAGES: Record<ContentErrorCode, string> = {
   'description-too-long': `详细说明最多 ${FIELD_LIMITS.description} 个字符`,
   'scenario-too-long': `使用场景最多 ${FIELD_LIMITS.scenario} 个字符`,
 };
+// 孤立 Unicode 代理码元的兼容链接 ------------------------------------------------
+// 合法 JSON 的字符串可以包含孤立代理码元（如 "旧意见\uD800" 解析出未配对的高代理，
+// 低代理单独出现同理）：文件是合法 UTF-8、记录结构也完整，这类意见必须照常读取。
+// 但 encodeURIComponent 遇到孤立代理码元会抛 URIError，旧首页因此无法为这类标识
+// 生成查看链接，整个列表渲染中断。
+//
+// 孤立代理码元无法作为普通 UTF-8 经 HTTP 原样传输：编码端与 WHATWG 解码端都会把
+// 它变成 U+FFFD，高代理与低代理到了对端无法区分。因此仅对 encodeURIComponent 失败
+// 的标识改用下面的兼容编码：每个孤立代理码元写成“%75”加四位大写十六进制
+// （%75 是字母 u 的百分号编码，形状即转义写法 uXXXX，如 %75D800），其余字符
+// （含成对代理码元组成的完整表情）仍按 encodeURIComponent。%75 永远不会出现在
+// encodeURIComponent 的正常输出里（字母 u 不会被它编码），所以兼容地址与已公开的
+// 普通路径地址永不冲突：中文、完整表情、空格、网址特殊字符与字面文字“\uD800”
+// （编码为 %5CuD800）都不会被误判为孤立代理项。
+function encodeCompatViewId(id: string): string {
+  let out = '';
+  for (let i = 0; i < id.length; i++) {
+    const unit = id.charCodeAt(i);
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const next = id.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        // 成对代理码元是完整字符（如表情），按普通路径编码，不进兼容形态
+        out += encodeURIComponent(id[i] + id[i + 1]);
+        i += 1;
+        continue;
+      }
+      out += '%75' + unit.toString(16).toUpperCase().padStart(4, '0');
+      continue;
+    }
+    if (unit >= 0xdc00 && unit <= 0xdfff) {
+      out += '%75' + unit.toString(16).toUpperCase().padStart(4, '0');
+      continue;
+    }
+    out += encodeURIComponent(id[i]);
+  }
+  return out;
+}
+// 一条意见的查看地址：恰为“.”或“..”继续走查询串（路径归一化会移除点段）；
+// 其余标识先尝试已公开的 /ideas/<encodeURIComponent(id)> 路径形式，只有该标识
+// 无法按普通百分号编码（含孤立代理码元）时才改用兼容编码。
+function buildViewHref(id: string): string {
+  if (id === '.' || id === '..') return `/ideas?id=${encodeURIComponent(id)}`;
+  try {
+    return `/ideas/${encodeURIComponent(id)}`;
+  } catch {
+    return `/ideas/${encodeCompatViewId(id)}`;
+  }
+}
+// 注入首页内联脚本：查看链接的生成与服务端共用同一份实现（与字段规则相同的注入方式），
+// 页面里不再另写一份编码逻辑。
+const viewLinkBrowserScript: string = `// 查看链接编码与服务端共用同一份实现（由 server.ts 注入，勿在此另写第二份）
+const encodeCompatViewId = ${encodeCompatViewId.toString()};
+const buildViewHref = ${buildViewHref.toString()};
+`;
 const PAGE: string = `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>FeatureHarbor · 产品意见与公开路线图</title><style>
 body{font-family:system-ui,sans-serif;max-width:52rem;margin:3rem auto;padding:0 1rem;line-height:1.7}
 a{color:#175b9c}
@@ -70,6 +124,7 @@ time{color:#666;font-size:.9rem}
 <p><a href="/api/ideas">查看意见列表接口</a> · <a href="/health">服务状态</a></p>
 </main><script>
 ${fieldRulesBrowserScript}
+${viewLinkBrowserScript}
 const form = document.getElementById('idea-form');
 const titleInput = document.getElementById('f-title');
 const descInput = document.getElementById('f-desc');
@@ -128,19 +183,13 @@ function renderIdea(idea) {
   time.textContent = isNaN(parsed.getTime()) ? String(idea.createdAt) : parsed.toLocaleString();
   item.append(time);
   // 每条已保存意见都有独立查看入口（搜索过滤后的结果与本页新提交同样带入口）：
-  // 链接只由该记录的标识 id 决定，与标题、说明文字无关；id 经 encodeURIComponent
-  // 编码，历史标识里的中文、空格或网址特殊字符也能准确指向自己的记录。
-  // 历史标题可能为空，但入口不依赖标题，空标题记录仍可打开。
-  // 标识恰为“.”或“..”时不能放进路径段：浏览器在发送前会做路径归一化，
-  // 即使把点写成 %2E 也一样被当作当前/上一级目录移除，/ideas/. 最终请求到
-  // /ideas/ 或首页，无法到达查看页；查询字符串不做这种归一化，因此这两个标识
-  // 改由 /ideas?id=<encodeURIComponent(id)> 携带。其余标识一律仍走路径形式，
-  // 链接与旧地址逐字不变（文字“%2E”是另一个标识，编码为 %252E，不受影响）。
+  // 链接只由该记录的标识 id 决定，与标题、说明文字无关。生成逻辑（buildViewHref）
+  // 与服务端共用同一份注入实现：恰为“.”或“..”的标识改走查询串，其余走路径段；
+  // 含孤立代理码元、encodeURIComponent 无法编码的历史标识改走兼容编码，
+  // 链接仍精确指向该记录，不会再因 URIError 中断整个列表，空标题记录同样可打开。
   const viewLink = document.createElement('a');
   viewLink.className = 'view-link';
-  viewLink.href = idea.id === '.' || idea.id === '..'
-    ? '/ideas?id=' + encodeURIComponent(idea.id)
-    : '/ideas/' + encodeURIComponent(idea.id);
+  viewLink.href = buildViewHref(idea.id);
   viewLink.textContent = '查看这条意见';
   item.append(viewLink);
   return item;
@@ -320,6 +369,12 @@ const VIEW_FIELD_LABELS = {
 // 不解析成页面元素；实体写法（如 &lt;）转义后显示为 &amp;lt;，仍是普通文字而不会被解码。
 function escapeHtml(text: string): string {
   return text
+    // 孤立代理码元无法以合法 UTF-8 写进响应（统一落成替代符号 U+FFFD，未配对的高代理
+    // 与低代理在页面上将无从区分）。先把每个孤立码元改写成字面的“反斜杠 uXXXX”文本：
+    // 这六个字符全是普通 ASCII，不产生页面元素，也让仅差在孤立代理项的两条记录在页面上
+    // 逐字可辨（\uD800 与 \uDC00 不同）。成对代理码元（完整表情）原样保留，不受影响。
+    .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g,
+      (unit) => `\\u${unit.charCodeAt(0).toString(16).toUpperCase().padStart(4, '0')}`)
     .replaceAll('&', '&amp;')
     .replaceAll('<', '&lt;')
     .replaceAll('>', '&gt;')
@@ -364,7 +419,7 @@ a{color:#175b9c}
 </main></html>`;
 }
 // GET /ideas/:id 与 GET /ideas?id=:id —— 只展示该条已保存意见的独立页面，链接可直接
-// 分享、刷新后仍是同一条。以记录标识精确匹配（先 decodeURIComponent 还原原始字符，
+// 分享、刷新后仍是同一条。以记录标识精确匹配（先还原标识的原始字符，
 // 中文、空格与特殊字符与存储的 id 逐字比较），标题与说明相同但 id 不同的记录各自打开
 // 各自的页面。存储读取失败明确提示加载失败（500），不能冒充不存在；能读取但找不到该 id
 // 才提示该意见不存在（404），不展示其他意见。
@@ -373,11 +428,53 @@ a{color:#175b9c}
 // 归一化，把它们当作当前/上一级目录移除——即使编码成 %2E 也一样（%2E 在路径段里会先
 // 解码再归一化），请求到不了这里。这两个标识由首页以 /ideas?id=<encoded> 的查询串形式
 // 给出，查询串不做路径归一化；encodedId 无论是路径段还是查询值，都统一在这里解码。
-function showIdeaView(res: ServerResponse, encodedId: string): void {
-  let targetId: string;
+//
+// 兼容编码 %75XXXX（见 encodeCompatViewId）只用于含孤立代理码元、无法普通百分号编码的
+// 历史标识。解码必须自左向右逐段切分：只在一个记号的边界上认出 %75 转义并还原成代理码元，
+// 其余部分仍交给标准 decodeURIComponent。不能用子串搜索——字面标识“%75D800”的普通编码
+// 是“%2575D800”，其中虽含有“%75D800”，但它出现在 %25（解码成 %）之后，不是记号起点，
+// 必须照常还原成字面六个字。触发形态严格限定为编码端实际产出的写法（%75 + 四位大写
+// 十六进制、值在代理区 D800–DFFF），因此 %75ud800、%75d800 之类都按普通百分号编码处理，
+// 不会被误判成孤立代理项；任何畸形百分号编码或无法还原的形态返回 null，按意见不存在
+// 处理，不猜测目标。
+const COMPAT_UNIT_PATTERN = /^%75D[89A-F][0-9A-F]{2}/;
+const PERCENT_ESCAPE_PATTERN = /^%[0-9A-Fa-f]{2}/;
+function decodeViewId(encoded: string): string | null {
+  let decoded = '';
+  let plain = '';
+  for (let i = 0; i < encoded.length;) {
+    const rest = encoded.slice(i);
+    const compat = COMPAT_UNIT_PATTERN.exec(rest);
+    if (compat) {
+      try {
+        decoded += decodeURIComponent(plain);
+      } catch {
+        return null;
+      }
+      plain = '';
+      decoded += String.fromCharCode(parseInt(compat[0].slice('%75'.length), 16));
+      i += compat[0].length;
+      continue;
+    }
+    if (rest[0] === '%') {
+      if (!PERCENT_ESCAPE_PATTERN.test(rest)) return null; // 畸形百分号编码
+      plain += rest.slice(0, 3);
+      i += 3;
+      continue;
+    }
+    plain += rest[0];
+    i += 1;
+  }
   try {
-    targetId = decodeURIComponent(encodedId);
+    decoded += decodeURIComponent(plain);
   } catch {
+    return null;
+  }
+  return decoded;
+}
+function showIdeaView(res: ServerResponse, encodedId: string): void {
+  const targetId = decodeViewId(encodedId);
+  if (targetId === null) {
     respond(res, 404, renderMessagePage('该意见不存在', '你查看的意见不存在，可能已被删除。'), { html: true });
     return;
   }

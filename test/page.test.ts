@@ -261,10 +261,38 @@ function findViewLink(article: El): El | undefined {
 
 // 首页为某条意见生成的独立查看地址：标识恰为“.”或“..”时改走查询串
 // （路径段会被网址路径归一化移除），其余标识走路径段；两者都经 encodeURIComponent。
+// 含孤立 Unicode 代理码元的标识无法用 encodeURIComponent（会抛 URIError），
+// 与内联脚本注入的 buildViewHref 同一条兜底规则：逐码元把孤立代理项编成
+// “%75”加四位大写十六进制（形状即 uXXXX 转义），成对代理码元（完整表情）仍普通编码。
+function encodeCompatViewId(id: string): string {
+  let out = '';
+  for (let i = 0; i < id.length; i++) {
+    const unit = id.charCodeAt(i);
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const next = id.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        out += encodeURIComponent(id[i] + id[i + 1]);
+        i += 1;
+        continue;
+      }
+      out += '%75' + unit.toString(16).toUpperCase().padStart(4, '0');
+      continue;
+    }
+    if (unit >= 0xdc00 && unit <= 0xdfff) {
+      out += '%75' + unit.toString(16).toUpperCase().padStart(4, '0');
+      continue;
+    }
+    out += encodeURIComponent(id[i]);
+  }
+  return out;
+}
 function expectedViewHref(id: string): string {
-  return id === '.' || id === '..'
-    ? `/ideas?id=${encodeURIComponent(id)}`
-    : `/ideas/${encodeURIComponent(id)}`;
+  if (id === '.' || id === '..') return `/ideas?id=${encodeURIComponent(id)}`;
+  try {
+    return `/ideas/${encodeURIComponent(id)}`;
+  } catch {
+    return `/ideas/${encodeCompatViewId(id)}`;
+  }
 }
 
 // 校验一条已渲染的意见与原记录逐字段对应：标题、详细说明、非空使用场景、提交时间、
@@ -2746,4 +2774,115 @@ test('查看入口：标识为“.”或“..”的历史记录改走查询串�
   assert.equal(visible.length, 2);
   assert.equal(findViewLink(visible[0])!.href, '/ideas?id=.');
   assert.equal(findViewLink(visible[1])!.href, '/ideas?id=..');
+});
+
+// 孤立 Unicode 代理码元标识的查看入口回归（首页内联脚本侧）。
+// 合法 JSON 可以解析出含未配对高/低代理码元的字符串（文件是合法 UTF-8、记录结构完整），
+// 这类历史意见必须照常出现在列表里；旧实现对其调用 encodeURIComponent 抛 URIError，
+// 整个列表无法渲染。兼容链接只用于这类标识：逐码元编成 %75XXXX，
+// 普通标识的已公开地址逐字不变。
+const HIGH = String.fromCharCode(0xd800);
+const LOW = String.fromCharCode(0xdc00);
+
+test('查看入口：含孤立代理码元标识的历史记录不再导致整列表失败，按原顺序完整出现且各自带兼容链接', async () => {
+  const ideas = [
+    makeIdea({ id: 'normal-first', title: '普通意见在前', description: '说明一' }),
+    makeIdea({ id: `旧意见${HIGH}`, title: '未配对高代理标识', description: '高代理正文', scenario: '高代理场景' }),
+    makeIdea({ id: `前缀${LOW}后缀`, title: '未配对低代理标识', description: '低代理正文' }),
+    makeIdea({ id: 'normal-last', title: '普通意见在后', description: '说明二' }),
+  ];
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas }));
+  await flush();
+
+  // 列表完整加载，不出现加载失败或空列表提示
+  assert.equal(h.els.empty.hidden, true);
+  assert.equal(h.els.error.hidden, true);
+  const articles = h.articles();
+  assert.equal(articles.length, 4);
+  assert.deepEqual(h.titles(), ideas.map((idea) => idea.title));
+  ideas.forEach((idea, index) => assertArticleMatches(articles[index], idea));
+
+  // 兼容链接精确形态：高代理码元编成 %75D800，普通中文部分仍按普通百分号编码
+  const links = articles.map((a) => findViewLink(a)!.href);
+  assert.equal(links[0], '/ideas/normal-first');
+  assert.equal(links[1], '/ideas/%E6%97%A7%E6%84%8F%E8%A7%81%75D800');
+  assert.equal(links[2], '/ideas/%E5%89%8D%E7%BC%80%75DC00%E5%90%8E%E7%BC%80');
+  assert.equal(links[3], '/ideas/normal-last');
+  for (const article of articles) {
+    assert.equal(findViewLink(article)!.textContent, '查看这条意见');
+  }
+});
+
+test('查看入口：标识只在孤立代理码元上不同（高/低）的同文意见保持独立，兼容链接互不相同', async () => {
+  const twinHigh = makeIdea({ id: `同文${HIGH}`, title: '完全相同的标题', description: '完全相同的说明', scenario: '' });
+  const twinLow = makeIdea({ id: `同文${LOW}`, title: '完全相同的标题', description: '完全相同的说明', scenario: '' });
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: [twinHigh, twinLow] }));
+  await flush();
+
+  const articles = h.articles();
+  assert.equal(articles.length, 2);
+  const highLink = findViewLink(articles[0])!.href;
+  const lowLink = findViewLink(articles[1])!.href;
+  assert.equal(highLink, '/ideas/%E5%90%8C%E6%96%87%75D800');
+  assert.equal(lowLink, '/ideas/%E5%90%8C%E6%96%87%75DC00');
+  assert.notEqual(highLink, lowLink);
+  assertArticleMatches(articles[0], twinHigh);
+  assertArticleMatches(articles[1], twinLow);
+});
+
+test('查看入口：搜索结果中的孤立代理码元标识记录仍带可用兼容链接', async () => {
+  const hit = makeIdea({ id: `命中${HIGH}`, title: '深色模式', description: '说明' });
+  const hitLow = makeIdea({ id: `也命中${LOW}`, title: '深色主题', description: '说明' });
+  const miss = makeIdea({ id: 'miss', title: '无关意见', description: '说明' });
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: [hit, hitLow, miss] }));
+  await flush();
+
+  h.search('深色');
+  const visible = h.articles();
+  assert.equal(visible.length, 2);
+  assert.equal(findViewLink(visible[0])!.href, '/ideas/%E5%91%BD%E4%B8%AD%75D800');
+  assert.equal(findViewLink(visible[1])!.href, '/ideas/%E4%B9%9F%E5%91%BD%E4%B8%AD%75DC00');
+});
+
+test('查看入口：普通标识不被误判成孤立代理项，已公开地址逐字不变', async () => {
+  const ideas = [
+    makeIdea({ id: '中文标识', title: '中文', description: '说明' }),
+    makeIdea({ id: 'emoji-😀-id', title: '完整表情', description: '说明' }),
+    makeIdea({ id: 'with space', title: '空格', description: '说明' }),
+    makeIdea({ id: 'a/b?c#d&e=1%2', title: '网址特殊字符', description: '说明' }),
+    // 字面六个字“\uD800”（反斜杠 u D 8 0 0），不含任何代理码元
+    makeIdea({ id: '\\uD800', title: '字面转义文字', description: '说明' }),
+    // 字面七个字“%75D800”，其普通编码含子串 %75D800 但必须按普通标识编码
+    makeIdea({ id: '%75D800', title: '字面百分号七字', description: '说明' }),
+  ];
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas }));
+  await flush();
+
+  const links = h.articles().map((a) => findViewLink(a)!.href);
+  assert.deepEqual(links, ideas.map((idea) => `/ideas/${encodeURIComponent(String(idea.id))}`));
+  assert.equal(links[1], '/ideas/emoji-%F0%9F%98%80-id');
+  assert.equal(links[4], '/ideas/%5CuD800');
+  assert.equal(links[5], '/ideas/%2575D800');
+});
+
+test('查看入口：本页提交确认、标识含孤立代理码元的意见同样带兼容链接', async () => {
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: [] }));
+  await flush();
+
+  h.setForm({ title: '标题', description: '说明' });
+  const submitted = h.submit();
+  const mine = makeIdea({ id: `just${LOW}saved`, title: '标题', description: '说明' });
+  h.posts[0].resolve(jsonResponse(201, { idea: mine }));
+  await submitted;
+  await flush();
+
+  const articles = h.articles();
+  assert.equal(articles.length, 1);
+  assertArticleMatches(articles[0], mine);
+  assert.equal(findViewLink(articles[0])!.href, '/ideas/just%75DC00saved');
 });

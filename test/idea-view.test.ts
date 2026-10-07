@@ -683,3 +683,229 @@ test('查看功能不改变现有接口与首页：列表返回、提交、首�
     removeDataDir(server);
   }
 });
+
+// 孤立 Unicode 代理码元标识的端到端回归 ------------------------------------------------
+// 合法 JSON 字符串可含未配对的高/低代理码元（如 "旧意见\uD800"）：文件是合法 UTF-8、
+// 记录结构完整，必须作为已有意见读取。这类标识无法用 encodeURIComponent（抛 URIError），
+// 首页改用兼容编码（每个孤立码元编成“%75”加四位大写十六进制，形如 uXXXX 转义）生成
+// /ideas/<兼容编码> 链接；这里直接以公开链接形态请求，覆盖直接打开、刷新、精确匹配、
+// 同文不同代理项相互独立、损坏与不存在的区分，以及读操作不改写存储。
+const HIGH_UNIT = String.fromCharCode(0xd800);
+const LOW_UNIT = String.fromCharCode(0xdc00);
+
+// 与 server.ts 的 encodeCompatViewId 逐字同规则，用于在测试里构造分享链接
+function encodeCompatViewId(id: string): string {
+  let out = '';
+  for (let i = 0; i < id.length; i++) {
+    const unit = id.charCodeAt(i);
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const next = id.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        out += encodeURIComponent(id[i] + id[i + 1]);
+        i += 1;
+        continue;
+      }
+      out += '%75' + unit.toString(16).toUpperCase().padStart(4, '0');
+      continue;
+    }
+    if (unit >= 0xdc00 && unit <= 0xdfff) {
+      out += '%75' + unit.toString(16).toUpperCase().padStart(4, '0');
+      continue;
+    }
+    out += encodeURIComponent(id[i]);
+  }
+  return out;
+}
+function compatUrl(server: StartedServer, id: string): string {
+  return `${server.origin}/ideas/${encodeCompatViewId(id)}`;
+}
+
+test('孤立代理码元标识：列表接口原样返回标识，兼容分享链接直接打开与刷新展示同一条且不依赖首页', async () => {
+  const dir = freshDir();
+  const highId = `旧意见${HIGH_UNIT}`;
+  const ideas: Idea[] = [
+    { id: 'normal-1', title: '普通意见', description: '普通正文', scenario: '', createdAt: '2026-01-01T00:00:00.000Z' },
+    { id: highId, title: '未配对高代理意见', description: `高代理正文${HIGH_UNIT}结尾`, scenario: '高代理场景', createdAt: '2026-02-02T00:00:00.000Z' },
+  ];
+  seedIdeas(dir, ideas);
+  const server = await startWith(dir);
+  try {
+    // 列表接口返回的原始标识保持不变：JSON 以 \ud800 转义承载，解析后仍是同一孤立码元
+    const listRes = await fetch(`${server.origin}/api/ideas`);
+    assert.equal(listRes.status, 200);
+    const list = await listRes.json();
+    assert.equal(list.ideas.length, 2);
+    assert.equal(list.ideas[1].id, highId);
+    assert.equal(list.ideas[1].id.charCodeAt(list.ideas[1].id.length - 1), 0xd800);
+
+    // 直接打开兼容链接（不经过首页）：200 且只展示这一条
+    const url = compatUrl(server, highId);
+    assert.equal(url, `${server.origin}/ideas/%E6%97%A7%E6%84%8F%E8%A7%81%75D800`);
+    const res = await fetch(url);
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    assert.ok(html.includes('未配对高代理意见'));
+    // 正文中的孤立码元同样以字面 \uD800 文本显示（而非替代符号），六字逐字出现在源码里
+    assert.ok(html.includes('高代理正文\\uD800结尾'), '正文中的孤立码元同样以可辨文字显示');
+    assert.ok(html.includes(escapeHtml('高代理场景')));
+    assert.ok(html.includes('意见标识：旧意见\\uD800'), '高代理码元以字面 \\uD800 显示，可与低代理区分');
+    assert.ok(!html.includes('意见标识：normal-1'), '不展示其他意见');
+    assertBackHome(html);
+
+    // 刷新（再次直接打开）逐字一致
+    const again = await fetch(url);
+    assert.equal(again.status, 200);
+    assert.equal(await again.text(), html);
+
+    // 另一条普通意见仍走已公开的普通路径地址
+    const normal = await fetchView(server, 'normal-1');
+    assert.equal(normal.status, 200);
+    assert.ok((await normal.text()).includes('意见标识：normal-1'));
+  } finally {
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('孤立代理码元标识：标题说明相同、标识仅差在高/低代理码元的两条记录各自独立、页面可区分', async () => {
+  const dir = freshDir();
+  const highId = `同文${HIGH_UNIT}`;
+  const lowId = `同文${LOW_UNIT}`;
+  const ideas: Idea[] = [
+    { id: highId, title: '完全相同的标题', description: '完全相同的说明', scenario: '', createdAt: '2020-01-01T00:00:00.000Z' },
+    { id: lowId, title: '完全相同的标题', description: '完全相同的说明', scenario: '', createdAt: '2020-02-02T00:00:00.000Z' },
+  ];
+  seedIdeas(dir, ideas);
+  const server = await startWith(dir);
+  try {
+    const highRes = await fetch(compatUrl(server, highId));
+    assert.equal(highRes.status, 200);
+    const highHtml = await highRes.text();
+    assert.ok(highHtml.includes('意见标识：同文\\uD800</p>'));
+    assert.ok(!highHtml.includes('意见标识：同文\\uDC00'));
+
+    const lowRes = await fetch(compatUrl(server, lowId));
+    assert.equal(lowRes.status, 200);
+    const lowHtml = await lowRes.text();
+    assert.ok(lowHtml.includes('意见标识：同文\\uDC00</p>'));
+    assert.ok(!lowHtml.includes('意见标识：同文\\uD800</p>'));
+
+    // 两页不同（提交时间与标识不同），不能都显示成相同的替代符号
+    assert.notEqual(highHtml, lowHtml);
+    assert.ok(!highHtml.includes('�'));
+    assert.ok(!lowHtml.includes('�'));
+  } finally {
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('孤立代理码元标识：查看是只读操作，磁盘逐字节不变；普通与点标识的既有地址不受影响', async () => {
+  const dir = freshDir();
+  const highId = `只读${HIGH_UNIT}`;
+  seedIdeas(dir, [
+    { id: '.', title: '单点意见', description: '单点正文', scenario: '', createdAt: '2020-03-03T00:00:00.000Z' },
+    { id: highId, title: '只读高代理', description: '正文', scenario: '', createdAt: '2020-04-04T00:00:00.000Z' },
+  ]);
+  const server = await startWith(dir);
+  const file = join(dir, 'ideas.json');
+  try {
+    const before = readFileSync(file);
+    await fetch(compatUrl(server, highId));
+    await fetchViewQuery(server, '.');
+    assert.deepEqual(readFileSync(file), before, '查看前后 ideas.json 逐字节一致');
+  } finally {
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('孤立代理码元标识：普通标识不被误判，字面“\\uD800”与“%75D800”仍走普通路径并指向原记录', async () => {
+  const dir = freshDir();
+  const literalEscape = '\\uD800'; // 六个普通 ASCII 字：反斜杠 u D 8 0 0
+  const literalPercent = '%75D800'; // 七个普通 ASCII 字
+  const emojiId = 'emoji-😀-id';
+  seedIdeas(dir, [
+    { id: literalEscape, title: '字面转义文字', description: '标识逐字是反斜杠uD800', scenario: '', createdAt: '2020-05-05T00:00:00.000Z' },
+    { id: literalPercent, title: '字面百分号七字', description: '标识逐字是百分号75D800', scenario: '', createdAt: '2020-06-06T00:00:00.000Z' },
+    { id: emojiId, title: '完整表情标识', description: '表情正文', scenario: '', createdAt: '2020-07-07T00:00:00.000Z' },
+  ]);
+  const server = await startWith(dir);
+  try {
+    const esc = await fetchView(server, literalEscape);
+    assert.equal(esc.status, 200);
+    const escHtml = await esc.text();
+    assert.ok(escHtml.includes('意见标识：\\uD800'));
+    assert.ok(escHtml.includes('字面转义文字'));
+
+    const pct = await fetchView(server, literalPercent);
+    assert.equal(pct.status, 200);
+    const pctHtml = await pct.text();
+    assert.ok(pctHtml.includes('意见标识：%75D800'));
+
+    const emoji = await fetchView(server, emojiId);
+    assert.equal(emoji.status, 200);
+    assert.ok((await emoji.text()).includes('意见标识：emoji-😀-id'));
+
+    // 真实的孤立高代理兼容链接不能被上面任何普通标识顶替
+    const surrogate = await fetch(`${server.origin}/ideas/%E4%B8%AD%75D800`);
+    assert.equal(surrogate.status, 404);
+  } finally {
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('孤立代理码元标识：兼容链接损坏或标识无法还原时 404；能还原但无记录也 404；存储不可读时 500', async () => {
+  const dir = freshDir();
+  const highId = `中${HIGH_UNIT}`;
+  seedIdeas(dir, [
+    { id: highId, title: '存在的高代理意见', description: '正文', scenario: '', createdAt: '2020-08-08T00:00:00.000Z' },
+  ]);
+  const server = await startWith(dir);
+  const file = join(dir, 'ideas.json');
+  try {
+    // 兼容转义之外混入畸形百分号编码：整条标识无法可靠还原，按不存在处理（不猜测、不 500）
+    for (const segment of ['x%75D800%zz', '%75D800%E4%B8', '%zz%75D800']) {
+      const res = await fetchViewRaw(server, segment);
+      assert.equal(res.status, 404, segment);
+      const html = await res.text();
+      assert.ok(html.includes('该意见不存在'), segment);
+      assertBackHome(html);
+    }
+
+    // 能正常还原成某个标识、但没有对应记录：同样 404。
+    // 其中两种易混淆形态也要走“正常解码再精确匹配”：
+    // %75DBFF 是合法的兼容转义（代理区末端 U+DBFF）；%75d800 是小写、不构成兼容转义，
+    // 按普通百分号编码还原成字面文字“ud800”——二者都不是存储中的那条“中\uD800”。
+    for (const segment of ['%75D800%E4%B8%AD', '%75DBFF', '%75d800', '%75D7FF']) {
+      const res = await fetchViewRaw(server, segment);
+      assert.equal(res.status, 404, segment);
+      assert.ok((await res.text()).includes('该意见不存在'), segment);
+    }
+
+    // 能正常还原成孤立码元标识、但没有对应记录：同样 404
+    const lowMissing = await fetch(`${server.origin}/ideas/${encodeCompatViewId(`中${LOW_UNIT}`)}`);
+    assert.equal(lowMissing.status, 404);
+    assert.ok((await lowMissing.text()).includes('该意见不存在'));
+
+    // 存储确实无法读取时仍是 500 加载失败，不把合法孤立代理标识当成数据错误
+    const bytesBefore = readFileSync(file);
+    writeFileSync(file, Buffer.from('not-json', 'utf8'));
+    const broken = await fetch(compatUrl(server, highId));
+    assert.equal(broken.status, 500);
+    const brokenHtml = await broken.text();
+    assert.ok(brokenHtml.includes('加载失败'));
+    assert.ok(!brokenHtml.includes('该意见不存在'));
+    assert.ok(!brokenHtml.includes('存在的高代理意见'));
+
+    // 数据恢复后同一兼容链接重新可用
+    writeFileSync(file, bytesBefore);
+    const recovered = await fetch(compatUrl(server, highId));
+    assert.equal(recovered.status, 200);
+    assert.ok((await recovered.text()).includes('存在的高代理意见'));
+  } finally {
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
