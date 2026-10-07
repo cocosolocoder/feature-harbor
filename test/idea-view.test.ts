@@ -49,6 +49,16 @@ async function fetchViewRaw(server: StartedServer, rawIdSegment: string, init?: 
   return fetch(`${server.origin}/ideas/${rawIdSegment}`, init);
 }
 
+// 标识为“.”或“..”时首页改用查询串形式（/ideas?id=<encoded>），避免网址路径归一化
+async function fetchViewQuery(server: StartedServer, id: string, init?: RequestInit): Promise<Response> {
+  return fetch(`${server.origin}/ideas?id=${encodeURIComponent(id)}`, init);
+}
+
+// 直接把未经编码的原始查询串拼到地址后，用于观察浏览器实际会发出的请求形态
+async function fetchViewQueryRaw(server: StartedServer, rawQuery: string, init?: RequestInit): Promise<Response> {
+  return fetch(`${server.origin}/ideas?${rawQuery}`, init);
+}
+
 // 与 server.ts 一致的 HTML 转义：服务端把意见文字转义后嵌进页面，
 // 断言源码中出现的是转义形态，标记样文本因此不可能被解析成元素。
 function escapeHtml(text: string): string {
@@ -215,6 +225,147 @@ test('历史标识含中文、空格与网址特殊字符：编码后的分享�
     assert.equal(literalSlash.status, 200);
     const literalSlashHtml = await literalSlash.text();
     assert.ok(literalSlashHtml.includes('意见标识：slash/inside'));
+  } finally {
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('历史标识为“.”或“..”：查询串形式的分享链接各自准确指向自己的记录，可直接打开与刷新', async () => {
+  const dir = freshDir();
+  // 同标题同说明、标识仅差在“.”“..”，另放字面文字“%2E”“%2E%2E”，证明四类互不相混
+  const ideas: Idea[] = [
+    { id: '..', title: '同文意见', description: '完全相同的详细说明', scenario: '上级点的场景', createdAt: '2020-02-02T00:00:00.000Z' },
+    { id: '.', title: '同文意见', description: '完全相同的详细说明', scenario: '', createdAt: '2020-01-01T00:00:00.000Z' },
+    { id: '%2E', title: '文字百分号二E', description: '标识逐字是 %2E', scenario: '', createdAt: '2020-03-03T00:00:00.000Z' },
+    { id: '%2E%2E', title: '文字百分号二E两次', description: '标识逐字是 %2E%2E', scenario: '', createdAt: '2020-04-04T00:00:00.000Z' },
+  ];
+  seedIdeas(dir, ideas);
+  const server = await startWith(dir);
+  try {
+    // 首页为“.”“..”生成的链接形态：标识放在查询串，且仍是 encodeURIComponent 后的原文
+    for (const id of ['.', '..']) {
+      const res = await fetchViewQuery(server, id);
+      assert.equal(res.status, 200, `id=${id}`);
+      const html = await res.text();
+      // 用 </p> 锚定标识块，避免“..”包含“.”前缀造成子串歧义
+      assert.ok(html.includes(`意见标识：${id}</p>`), `id=${id}`);
+      assert.ok(html.includes(escapeHtml('同文意见')));
+      // 页面只属于自己这一条：另一个点标识不能出现
+      assert.ok(!html.includes(`意见标识：${id === '.' ? '..' : '.'}</p>`));
+      assert.ok(!html.includes('文字百分号二E'));
+      assertBackHome(html);
+      // 直接打开与刷新等价：再次 GET 返回逐字相同的页面
+      const again = await fetchViewQuery(server, id);
+      assert.equal(again.status, 200);
+      assert.equal(await again.text(), html);
+    }
+    // “.”记录 scenario 为空时不显示场景段；“..”记录的场景正常显示
+    const dotHtml = await (await fetchViewQuery(server, '.')).text();
+    assert.ok(!dotHtml.includes('使用场景：'));
+    const dotDotHtml = await (await fetchViewQuery(server, '..')).text();
+    assert.ok(dotDotHtml.includes(escapeHtml('上级点的场景')));
+
+    // 未编码的点（浏览器从 /ideas?id=. 直接发出的形态）与编码成 %2E 的查询值
+    // 解码后是同一标识，展示结果必须一致
+    const rawDot = await fetchViewQueryRaw(server, 'id=.');
+    assert.equal(rawDot.status, 200);
+    const rawDotHtml = await rawDot.text();
+    assert.ok(rawDotHtml.includes('意见标识：.'));
+    const encodedDot = await fetchViewQueryRaw(server, 'id=%2E');
+    assert.equal(encodedDot.status, 200);
+    assert.equal(await encodedDot.text(), rawDotHtml);
+    const encodedDotDot = await fetchViewQueryRaw(server, 'id=%2E%2E');
+    assert.equal(encodedDotDot.status, 200);
+    assert.ok((await encodedDotDot.text()).includes('意见标识：..'));
+
+    // 文字“%2E”“%2E%2E”仍是不同标识，继续走路径形式并显示各自的记录，
+    // 不能因为点标识改用查询串而与“.”“..”混成一条
+    const literalOne = await fetchView(server, '%2E');
+    assert.equal(literalOne.status, 200);
+    const literalOneHtml = await literalOne.text();
+    assert.ok(literalOneHtml.includes('意见标识：%2E'));
+    assert.ok(literalOneHtml.includes('文字百分号二E'));
+    assert.ok(!literalOneHtml.includes('意见标识：.'));
+    const literalTwo = await fetchView(server, '%2E%2E');
+    assert.equal(literalTwo.status, 200);
+    const literalTwoHtml = await literalTwo.text();
+    assert.ok(literalTwoHtml.includes('意见标识：%2E%2E'));
+    assert.ok(!literalTwoHtml.includes('意见标识：..'));
+
+    // 查询串指向不存在的标识：404 明确提示不存在，不展示其他意见
+    const missing = await fetchViewQuery(server, 'no-such-id');
+    assert.equal(missing.status, 404);
+    const missingHtml = await missing.text();
+    assert.ok(missingHtml.includes('该意见不存在'));
+    assert.ok(!missingHtml.includes('意见标识：.'));
+    assertBackHome(missingHtml);
+  } finally {
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('历史标识为“.”“..”且历史标题为空白：查询串入口仍能打开，并可辨认当前是哪条', async () => {
+  const dir = freshDir();
+  const ideas: Idea[] = [
+    { id: '.', title: '  \t\n ', description: '单点的空白标题正文', scenario: '单点场景', createdAt: '2020-01-01T00:01:00.000Z' },
+    { id: '..', title: '', description: '双点的空标题正文', scenario: '', createdAt: '2020-02-02T00:02:00.000Z' },
+  ];
+  seedIdeas(dir, ideas);
+  const server = await startWith(dir);
+  try {
+    for (const idea of ideas) {
+      const res = await fetchViewQuery(server, idea.id);
+      assert.equal(res.status, 200, `id=${idea.id}`);
+      const html = await res.text();
+      assert.ok(html.includes(`意见标识：${idea.id}`));
+      assert.ok(html.includes(escapeHtml(idea.description)));
+      assertBackHome(html);
+    }
+  } finally {
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('点标识查看入口的边界：无 id 查询仍为 JSON 404；畸形编码 404 页面；非 GET 405；存储损坏 500', async () => {
+  const dir = freshDir();
+  seedIdeas(dir, [
+    { id: '.', title: '单点标题 AAA', description: '单点正文 BBB', scenario: '', createdAt: '2020-01-01T00:00:00.000Z' },
+  ]);
+  const server = await startWith(dir);
+  const file = join(dir, 'ideas.json');
+  try {
+    // /ideas 不带 id、带空 id 或带其他参数，都与 /ideas/ 一样属于未知路径（JSON 404）
+    for (const path of ['/ideas', '/ideas?', '/ideas?id=', '/ideas?other=.', '/ideas?id']) {
+      const res = await fetch(`${server.origin}${path}`);
+      assert.equal(res.status, 404, path);
+      const data = await res.json();
+      assert.equal(data.error, 'not found', path);
+    }
+
+    // 查询串里畸形的百分号编码按“该意见不存在”处理，不能导致 500
+    for (const query of ['id=%zz', 'id=%', 'id=%E4%B8%AD']) {
+      const res = await fetchViewQueryRaw(server, query);
+      assert.equal(res.status, 404, query);
+      const html = await res.text();
+      assert.ok(html.includes('该意见不存在'), query);
+    }
+
+    // 查看页（含查询形式）只支持 GET
+    const del = await fetchViewQuery(server, '.', { method: 'DELETE' });
+    assert.equal(del.status, 405);
+    assert.match(del.headers.get('allow') ?? '', /GET/);
+
+    // 存储损坏时查询形式同样报 500，不能把读取失败冒充成“意见不存在”
+    writeFileSync(file, Buffer.from('not-json', 'utf8'));
+    const broken = await fetchViewQuery(server, '.');
+    assert.equal(broken.status, 500);
+    const brokenHtml = await broken.text();
+    assert.ok(brokenHtml.includes('加载失败'));
+    assert.ok(!brokenHtml.includes('该意见不存在'));
+    assert.ok(!brokenHtml.includes('单点标题 AAA'));
   } finally {
     await server.stop();
     rmSync(dir, { recursive: true, force: true });

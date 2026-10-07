@@ -259,6 +259,14 @@ function findViewLink(article: El): El | undefined {
   return article.children.find((node) => node.tagName === 'A' && node.className === 'view-link');
 }
 
+// 首页为某条意见生成的独立查看地址：标识恰为“.”或“..”时改走查询串
+// （路径段会被网址路径归一化移除），其余标识走路径段；两者都经 encodeURIComponent。
+function expectedViewHref(id: string): string {
+  return id === '.' || id === '..'
+    ? `/ideas?id=${encodeURIComponent(id)}`
+    : `/ideas/${encodeURIComponent(id)}`;
+}
+
 // 校验一条已渲染的意见与原记录逐字段对应：标题、详细说明、非空使用场景、提交时间、
 // 独立查看入口（链接只由该记录的 id 决定，与标题/说明文字无关）
 function assertArticleMatches(article: El, idea: Record<string, unknown>): void {
@@ -283,7 +291,7 @@ function assertArticleMatches(article: El, idea: Record<string, unknown>): void 
   // 每条意见都有独立查看入口：href 只由 id 经 encodeURIComponent 拼成，可直接分享
   const viewLink = findViewLink(article);
   assert.ok(viewLink, '每条意见都应有查看入口');
-  assert.equal(viewLink!.href, `/ideas/${encodeURIComponent(String(idea.id))}`);
+  assert.equal(viewLink!.href, expectedViewHref(String(idea.id)));
   assert.equal(viewLink!.textContent, '查看这条意见');
 }
 
@@ -2698,4 +2706,44 @@ test('查看入口：本页新提交确认的意见同样带入口，入口以�
   assert.equal(articles.length, 1);
   assertArticleMatches(articles[0], mine);
   assert.equal(findViewLink(articles[0])!.href, '/ideas/just-saved-1');
+});
+
+// 历史标识为“.”或“..”时不能使用路径段：浏览器发送前会做路径归一化，
+// 即使编码成 %2E 也会被当作当前/上一级目录移除，导致链接落到 /ideas/ 或首页。
+// 首页因此只对这两个标识改走查询串 /ideas?id=<encoded>；其余标识的链接保持路径形式不变。
+test('查看入口：标识为“.”或“..”的历史记录改走查询串链接，其余标识仍走路径形式', async () => {
+  const ideas = [
+    makeIdea({ id: '.', title: '单点意见', description: '说明' }),
+    makeIdea({ id: '..', title: '双点意见', description: '说明' }),
+    makeIdea({ id: '%2E', title: '字面百分号二E', description: '说明' }),
+    makeIdea({ id: '%2E%2E', title: '字面百分号二E两次', description: '说明' }),
+    makeIdea({ id: '...', title: '三个点不受影响', description: '说明' }),
+    makeIdea({ id: 'normal-1', title: '普通意见', description: '说明' }),
+  ];
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas }));
+  await flush();
+
+  const expected = ideas.map((idea) => expectedViewHref(String(idea.id)));
+  const links = h.articles().map((a) => findViewLink(a)!.href);
+  assert.deepEqual(links, expected);
+  // 两个点标识各自独立、互不相同，也不与字面 %2E 记录混用
+  assert.equal(links[0], '/ideas?id=.');
+  assert.equal(links[1], '/ideas?id=..');
+  assert.notEqual(links[0], links[1]);
+  assert.equal(links[2], '/ideas/%252E');
+  assert.equal(links[3], '/ideas/%252E%252E');
+  assert.equal(links[4], '/ideas/...');
+  assert.equal(links[5], '/ideas/normal-1');
+  // 链接仍是可点击的普通查看入口
+  for (const article of h.articles()) {
+    assert.equal(findViewLink(article)!.textContent, '查看这条意见');
+  }
+
+  // 搜索结果中同样保留查询串入口：过滤后只看点与双点（“三个点不受影响”不含“点意见”）
+  h.search('点意见');
+  const visible = h.articles();
+  assert.equal(visible.length, 2);
+  assert.equal(findViewLink(visible[0])!.href, '/ideas?id=.');
+  assert.equal(findViewLink(visible[1])!.href, '/ideas?id=..');
 });

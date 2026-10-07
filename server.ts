@@ -131,9 +131,16 @@ function renderIdea(idea) {
   // 链接只由该记录的标识 id 决定，与标题、说明文字无关；id 经 encodeURIComponent
   // 编码，历史标识里的中文、空格或网址特殊字符也能准确指向自己的记录。
   // 历史标题可能为空，但入口不依赖标题，空标题记录仍可打开。
+  // 标识恰为“.”或“..”时不能放进路径段：浏览器在发送前会做路径归一化，
+  // 即使把点写成 %2E 也一样被当作当前/上一级目录移除，/ideas/. 最终请求到
+  // /ideas/ 或首页，无法到达查看页；查询字符串不做这种归一化，因此这两个标识
+  // 改由 /ideas?id=<encodeURIComponent(id)> 携带。其余标识一律仍走路径形式，
+  // 链接与旧地址逐字不变（文字“%2E”是另一个标识，编码为 %252E，不受影响）。
   const viewLink = document.createElement('a');
   viewLink.className = 'view-link';
-  viewLink.href = '/ideas/' + encodeURIComponent(idea.id);
+  viewLink.href = idea.id === '.' || idea.id === '..'
+    ? '/ideas?id=' + encodeURIComponent(idea.id)
+    : '/ideas/' + encodeURIComponent(idea.id);
   viewLink.textContent = '查看这条意见';
   item.append(viewLink);
   return item;
@@ -299,6 +306,9 @@ searchClear.addEventListener('click', () => {
 loadIdeas();
 </script></html>`;
 const VIEW_PATH_PREFIX = '/ideas/';
+// 查看入口的集合路径：标识恰为“.”或“..”时无法使用路径段（会被网址路径归一化
+// 移除，写成 %2E 也一样），首页改把标识放在查询串 /ideas?id= 中，这里负责接收。
+const VIEW_COLLECTION_PATH = '/ideas';
 // 单条意见查看页只展示常规字段（标题、完整详细说明、非空白使用场景、提交时间），
 // 记录携带的附加信息一律不在页面公开。与首页一样，历史内容不重新套用新提交的限制：
 // 超限、空白标题/说明、换行、中文、表情、网页标记样文本与实体写法都按原文显示。
@@ -353,14 +363,20 @@ a{color:#175b9c}
 <p>${message}</p>
 </main></html>`;
 }
-// GET /ideas/:id —— 只展示该条已保存意见的独立页面，链接可直接分享、刷新后仍是同一条。
-// 以记录标识精确匹配（先 decodeURIComponent 还原路径段，中文、空格与特殊字符与原 id 逐字比较），
-// 标题与说明相同但 id 不同的记录各自打开各自的页面。存储读取失败明确提示加载失败（500），
-// 不能冒充不存在；能读取但找不到该 id 才提示该意见不存在（404），不展示其他意见。
-function handleIdeaView(res: ServerResponse, rawPath: string): void {
+// GET /ideas/:id 与 GET /ideas?id=:id —— 只展示该条已保存意见的独立页面，链接可直接
+// 分享、刷新后仍是同一条。以记录标识精确匹配（先 decodeURIComponent 还原原始字符，
+// 中文、空格与特殊字符与存储的 id 逐字比较），标题与说明相同但 id 不同的记录各自打开
+// 各自的页面。存储读取失败明确提示加载失败（500），不能冒充不存在；能读取但找不到该 id
+// 才提示该意见不存在（404），不展示其他意见。
+//
+// 标识恰为“.”或“..”时不能作为路径段：浏览器与服务端的 WHATWG 网址解析都会做路径
+// 归一化，把它们当作当前/上一级目录移除——即使编码成 %2E 也一样（%2E 在路径段里会先
+// 解码再归一化），请求到不了这里。这两个标识由首页以 /ideas?id=<encoded> 的查询串形式
+// 给出，查询串不做路径归一化；encodedId 无论是路径段还是查询值，都统一在这里解码。
+function showIdeaView(res: ServerResponse, encodedId: string): void {
   let targetId: string;
   try {
-    targetId = decodeURIComponent(rawPath.slice(VIEW_PATH_PREFIX.length));
+    targetId = decodeURIComponent(encodedId);
   } catch {
     respond(res, 404, renderMessagePage('该意见不存在', '你查看的意见不存在，可能已被删除。'), { html: true });
     return;
@@ -379,6 +395,24 @@ function handleIdeaView(res: ServerResponse, rawPath: string): void {
     return;
   }
   respond(res, 200, renderIdeaViewPage(match), { html: true });
+}
+// 路径段形式：/ideas/<encoded-id>，剥掉统一前缀后交给共用的解码渲染逻辑。
+function handleIdeaView(res: ServerResponse, rawPath: string): void {
+  showIdeaView(res, rawPath.slice(VIEW_PATH_PREFIX.length));
+}
+// 从 /ideas?id=<encoded-id> 的原始查询串中取出标识值（仍是 percent-encoded）。
+// 只识别 id：取第一个 id 参数；裸 id（没有“=”）或空值视为没有标识段（返回 null，
+// 路由按 /ideas 无标识处理）；这里不解码，畸形百分号编码交给 decodeURIComponent 判错。
+function extractViewQueryId(search: string): string | null {
+  if (!search.startsWith('?')) return null;
+  for (const pair of search.slice(1).split('&')) {
+    const equals = pair.indexOf('=');
+    if ((equals === -1 ? pair : pair.slice(0, equals)) !== 'id') continue;
+    if (equals === -1) return null;
+    const value = pair.slice(equals + 1);
+    return value.length > 0 ? value : null;
+  }
+  return null;
 }
 const args: string[] = process.argv.slice(2);
 const help: string = `FeatureHarbor - 产品意见与公开路线图
@@ -563,10 +597,15 @@ async function handleCreateIdea(req: IncomingMessage, res: ServerResponse): Prom
   respond(res, 201, { idea });
 }
 const server = createServer((req: IncomingMessage, res: ServerResponse): void => {
-  let route: string;
-  try { route = new URL(req.url ?? '/', 'http://localhost').pathname; } catch { respond(res, 400, { error: 'invalid request path' }); return; }
+  let parsedUrl: URL;
+  try { parsedUrl = new URL(req.url ?? '/', 'http://localhost'); } catch { respond(res, 400, { error: 'invalid request path' }); return; }
+  const route: string = parsedUrl.pathname;
+  // /ideas 本身没有路径段；只有携带非空 id 查询串时才是查看页入口（专供“.”“..”这类
+  // 无法作为路径段的标识）。没有 id 的 /ideas 与 /ideas/ 一样属于未知路径（JSON 404）。
+  const queryViewId = route === VIEW_COLLECTION_PATH ? extractViewQueryId(parsedUrl.search) : null;
   if (!['/', '/health', '/api/ideas'].includes(route) &&
-      !(route.startsWith(VIEW_PATH_PREFIX) && route.length > VIEW_PATH_PREFIX.length)) {
+      !(route.startsWith(VIEW_PATH_PREFIX) && route.length > VIEW_PATH_PREFIX.length) &&
+      queryViewId === null) {
     respond(res, 404, { error: 'not found' });
     return;
   }
@@ -584,11 +623,17 @@ const server = createServer((req: IncomingMessage, res: ServerResponse): void =>
     return;
   }
   // 单条意见查看页：路径段 /ideas/:id 由 URL 解析保证是 percent-encoded，
-  // handleIdeaView 内先 decodeURIComponent 再与存储的 id 逐字比较，
+  // showIdeaView 内先 decodeURIComponent 再与存储的 id 逐字比较，
   // 历史标识中的中文、空格与网址特殊字符经分享链接也能准确指向原记录。
-  if (route.startsWith(VIEW_PATH_PREFIX)) {
+  // 路径段形式与 /ideas?id= 查询形式（仅“.”“..”标识使用）共用同一套解码与渲染。
+  if (route.startsWith(VIEW_PATH_PREFIX) && route.length > VIEW_PATH_PREFIX.length) {
     if (req.method !== 'GET') { respond(res, 405, { error: 'method not allowed' }, { allow: 'GET' }); return; }
     handleIdeaView(res, route);
+    return;
+  }
+  if (queryViewId !== null) {
+    if (req.method !== 'GET') { respond(res, 405, { error: 'method not allowed' }, { allow: 'GET' }); return; }
+    showIdeaView(res, queryViewId);
     return;
   }
   if (req.method !== 'GET') { respond(res, 405, { error: 'method not allowed' }); return; }
