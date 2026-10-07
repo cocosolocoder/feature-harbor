@@ -33,6 +33,7 @@ interface El {
   hidden: boolean;
   value: string;
   dateTime: string;
+  href: string;
   children: El[];
   text: string | null;
   textContent: string;
@@ -52,6 +53,7 @@ function makeElement(tag: string): El {
     hidden: false,
     value: '',
     dateTime: '',
+    href: '',
     children: [],
     text: null as string | null,
     innerHTMLAssigned: false,
@@ -1827,15 +1829,35 @@ const ENTITY_DESCRIPTION = '已有写法 &lt;p&gt;段落&lt;/p&gt;、&amp;、&qu
 const ENTITY_SCENARIO = '&lt;场景&gt; &amp; "引号"';
 
 // 渲染意见只应产生的元素；意见文字里的脚本、图片、链接、表单、加粗等标记
-// 一旦被当成网页结构，就会多出此集合之外的元素
-const RENDER_TAGS = new Set(['ARTICLE', 'H3', 'P', 'STRONG', 'SPAN', 'TIME']);
+// 一旦被当成网页结构，就会多出此集合之外的元素。
+// A 是每条意见固定的“查看这条意见”入口（页面结构，不是由意见文字生成的）：
+// 文案固定、href 由 id 经 encodeURIComponent 得到，意见内容里的 <a> 样文本仍不允许生成 A。
+const RENDER_TAGS = new Set(['ARTICLE', 'H3', 'P', 'STRONG', 'SPAN', 'TIME', 'A']);
+const VIEW_LINK_TEXT = '查看这条意见';
+
+// 找到一条已渲染意见的查看入口
+function findViewLink(article: El): El {
+  const line = article.children.find((n) => n.tagName === 'P' && n.className === 'view-link');
+  assert.ok(line, '每条意见都应有查看入口所在的段落');
+  const link = line!.children.find((n) => n.tagName === 'A');
+  assert.ok(link, '每条意见都应有查看入口链接');
+  return link!;
+}
 
 // 断言整个渲染过程只产生纯文本结构：不创建意见文字里出现的元素、不经过 innerHTML、
-// 列表里只有意见记录本身（没有额外插入的表单或记录）
+// 列表里只有意见记录本身（没有额外插入的表单或记录）；
+// A 元素只允许是固定文案、指向编码后标识的查看入口，不能来自意见文字。
 function assertPlainTextOnly(h: Harness): void {
   for (const el of h.created) {
     assert.ok(RENDER_TAGS.has(el.tagName), `不应为意见内容创建 ${el.tagName} 元素`);
     assert.equal(el.innerHTMLAssigned, false, '不应通过 innerHTML 渲染意见内容');
+    if (el.tagName === 'A') {
+      assert.equal(el.textContent, VIEW_LINK_TEXT, '链接元素只能是固定的查看入口，不能由意见文字生成');
+      assert.match(el.href, /^\/ideas\//, '查看入口必须指向单条意见地址');
+      // href 必须是百分号编码后的标识：不能出现原始空格或网址保留字符
+      assert.equal(/\s/.test(el.href), false, '查看链接中的标识必须经过编码');
+      assert.equal(/[?#]/.test(el.href.slice('/ideas/'.length)), false, '查看链接中的 ? # 必须编码');
+    }
   }
   for (const child of h.els.ideas.children) {
     assert.equal(child.tagName, 'ARTICLE', '列表中不应插入意见记录之外的内容');
@@ -2597,4 +2619,116 @@ test('结构判定不为接受超限旧内容而放宽：结构完整的超限�
       assert.equal(h.articles().length, 0, c.name);
     });
   }
+});
+
+// 每条意见的独立查看入口回归（首页列表与搜索结果共用 renderIdea，
+// 因此两种情况下可见的每条记录都必须带清楚的查看入口）。
+test('查看入口：首次列表中的每条意见都带固定文案的链接，href 为编码后的标识地址', async () => {
+  const r1 = makeIdea({ id: 'r1', title: '意见一' });
+  const r2 = makeIdea({ id: 'r2', title: '意见二' });
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: [r1, r2] }));
+  await flush();
+
+  const articles = h.articles();
+  assert.equal(articles.length, 2);
+  assert.equal(findViewLink(articles[0]).textContent, VIEW_LINK_TEXT);
+  assert.equal(findViewLink(articles[0]).href, '/ideas/r1');
+  assert.equal(findViewLink(articles[1]).href, '/ideas/r2');
+});
+
+test('查看入口：标题和说明相同但标识不同的两条意见，入口各自打开各自的记录', async () => {
+  const first = makeIdea({ id: 'id-x', title: '同文', description: '同文' });
+  const second = makeIdea({ id: 'id-y', title: '同文', description: '同文' });
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: [first, second] }));
+  await flush();
+
+  const articles = h.articles();
+  assert.equal(findViewLink(articles[0]).href, '/ideas/id-x');
+  assert.equal(findViewLink(articles[1]).href, '/ideas/id-y');
+  assert.notEqual(findViewLink(articles[0]).href, findViewLink(articles[1]).href);
+});
+
+test('查看入口：历史标题为空或纯空白时记录仍有可操作的查看入口，不依赖标题文字', async () => {
+  const ideas = [
+    makeIdea({ id: 'empty-title', title: '', description: '空标题正文' }),
+    makeIdea({ id: 'blank-title', title: '  \t\n ', description: '空白标题正文', scenario: '有场景' }),
+    makeIdea({ id: 'normal', title: '正常标题', description: '正文' }),
+  ];
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas }));
+  await flush();
+
+  const articles = h.articles();
+  assert.equal(articles.length, 3);
+  assert.equal(findViewLink(articles[0]).href, '/ideas/empty-title');
+  assert.equal(findViewLink(articles[0]).textContent, VIEW_LINK_TEXT);
+  assert.equal(findViewLink(articles[1]).href, '/ideas/blank-title');
+  assert.equal(findViewLink(articles[2]).href, '/ideas/normal');
+});
+
+test('查看入口：历史标识含中文、空格、斜杠、问号、井号、百分号与表情时逐段编码', async () => {
+  const special = makeIdea({ id: '旧 标识/a?b#c 100%😀', title: '特殊标识意见' });
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: [special] }));
+  await flush();
+
+  const href = findViewLink(h.articles()[0]).href;
+  assert.equal(href, '/ideas/' + encodeURIComponent('旧 标识/a?b#c 100%😀'));
+  // 关键保留字符必须以百分号形式出现，不能在地址里裸露
+  assert.ok(href.includes('%20'));
+  assert.ok(href.includes('%2F'));
+  assert.ok(href.includes('%3F'));
+  assert.ok(href.includes('%23'));
+  assert.ok(href.includes('%25'));
+  // 编码后解码应还原原标识
+  assert.equal(decodeURIComponent(href.slice('/ideas/'.length)), '旧 标识/a?b#c 100%😀');
+});
+
+test('查看入口：搜索结果中每条可见意见同样带查看入口，清空搜索后入口保持', async () => {
+  const ideas = [
+    makeIdea({ id: 'hit-1', title: '深色模式', description: '说明' }),
+    makeIdea({ id: 'hit-2', title: '深色主题', description: '说明' }),
+    makeIdea({ id: 'miss', title: '导出数据', description: '说明' }),
+  ];
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas }));
+  await flush();
+
+  h.search('深色');
+  let visible = h.articles();
+  assert.equal(visible.length, 2);
+  assert.deepEqual(visible.map((a) => findViewLink(a).href), ['/ideas/hit-1', '/ideas/hit-2']);
+
+  // 搜索不到时没有可见记录，自然没有入口；清空后全部记录的入口恢复
+  h.search('完全不沾边的关键词');
+  assert.equal(h.articles().length, 0);
+  h.clearSearch();
+  visible = h.articles();
+  assert.deepEqual(visible.map((a) => findViewLink(a).href), ['/ideas/hit-1', '/ideas/hit-2', '/ideas/miss']);
+});
+
+test('查看入口：本页提交成功的新意见也带查看入口，且指向其服务端返回的标识', async () => {
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: [] }));
+  await flush();
+
+  h.setForm({ title: '新意见', description: '新说明' });
+  const submitted = h.submit();
+  const mine = makeIdea({ id: 'a b?c', title: '新意见', description: '新说明' });
+  h.posts[0].resolve(jsonResponse(201, { idea: mine }));
+  await submitted;
+  await flush();
+
+  assert.equal(findViewLink(h.articles()[0]).href, '/ideas/' + encodeURIComponent('a b?c'));
+});
+
+test('查看入口：纯页面结构，不发起额外请求，不改变列表加载与提交的请求次数', async () => {
+  const h = new Harness(pageScript);
+  h.gets[0].resolve(jsonResponse(200, { ideas: [makeIdea({ id: 'r1' }), makeIdea({ id: 'r2' })] }));
+  await flush();
+  // 入口只是链接：渲染列表不应触发任何请求
+  assert.equal(h.getsIssued, 1);
+  assert.equal(h.postsIssued, 0);
 });

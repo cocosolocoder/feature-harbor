@@ -27,7 +27,8 @@ const CONTENT_ERROR_MESSAGES: Record<ContentErrorCode, string> = {
   'description-too-long': `详细说明最多 ${FIELD_LIMITS.description} 个字符`,
   'scenario-too-long': `使用场景最多 ${FIELD_LIMITS.scenario} 个字符`,
 };
-const PAGE: string = `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>FeatureHarbor · 产品意见与公开路线图</title><style>
+// 首页与单条意见查看页共用的样式。
+const PAGE_STYLE: string = `
 body{font-family:system-ui,sans-serif;max-width:52rem;margin:3rem auto;padding:0 1rem;line-height:1.7}
 a{color:#175b9c}
 label{display:block;font-weight:600;margin-top:1rem}
@@ -44,7 +45,11 @@ time{color:#666;font-size:.9rem}
 #search-form{margin:1rem 0}
 #search-form input{max-width:20rem;margin-right:.5rem}
 #search-form button{margin-top:.25rem;margin-right:.5rem}
-</style><main><h1>FeatureHarbor</h1><p>产品意见与公开路线图</p>
+.view-link{margin-top:.5rem}
+#detail-note{color:#b00020}
+.back{margin-top:2rem}
+`;
+const PAGE: string = `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>FeatureHarbor · 产品意见与公开路线图</title><style>${PAGE_STYLE}</style><main><h1>FeatureHarbor</h1><p>产品意见与公开路线图</p>
 <h2>提交产品意见</h2>
 <form id="idea-form" novalidate>
 <label for="f-title">标题 <span class="required">*</span>（必填，最多 ${FIELD_LIMITS.title} 字）</label>
@@ -126,6 +131,19 @@ function renderIdea(idea) {
   const parsed = new Date(idea.createdAt);
   time.textContent = isNaN(parsed.getTime()) ? String(idea.createdAt) : parsed.toLocaleString();
   item.append(time);
+  // 每条已保存意见都有独立查看入口（首页列表与搜索结果共用同一个 renderIdea，
+  // 因此搜索过滤后可见的每条记录同样带入口）。链接以标识区分记录：同标题同说明、
+  // 不同 id 的两条意见各自指向自己的页面；历史标识可能含中文、空格或网址保留字符，
+  // 必须逐段 encodeURIComponent 后拼接（空格、/ ? # 等都变成百分号序列），
+  // 直接分享或刷新该地址才能准确找回原记录。
+  // 入口不使用标题文字（历史标题可能为空白），空标题记录仍可打开。
+  const viewLine = document.createElement('p');
+  viewLine.className = 'view-link';
+  const viewLink = document.createElement('a');
+  viewLink.href = '/ideas/' + encodeURIComponent(idea.id);
+  viewLink.textContent = '查看这条意见';
+  viewLine.append(viewLink);
+  item.append(viewLine);
   return item;
 }
 let remoteIdeas = [];
@@ -287,6 +305,91 @@ searchClear.addEventListener('click', () => {
   renderList();
 });
 loadIdeas();
+</script></html>`;
+// 单条意见查看页：内容不在服务端拼进 HTML（意见文字含尖括号、实体写法等，
+// 只允许作为普通文本显示），页面脚本打开后按地址栏里的意见标识直接请求
+// GET /api/ideas/<encoded-id>，与是否访问过首页、是否搜索、是否提交过完全无关；
+// 刷新或直接把地址分享给别人，看到的都是存储中同一条已保存意见。
+// 展示字段与首页列表同源（都取自接口返回的已保存记录），不从表单草稿或搜索词拼详情，
+// 记录携带的常规字段之外的附加信息不在本页公开。
+const DETAIL_PAGE: string = `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>意见详情 · FeatureHarbor</title><style>${PAGE_STYLE}</style><main>
+<p><a href="/">&larr; 返回首页</a></p>
+<h1>意见详情</h1>
+<p id="detail-note" role="alert" hidden></p>
+<article id="idea-detail" class="idea" hidden>
+<h2 id="d-title"></h2>
+<p id="d-desc" class="pre"></p>
+<p id="d-scenario-row" hidden><strong>使用场景：</strong><span id="d-scenario" class="pre"></span></p>
+<p>提交时间：<time id="d-time"></time></p>
+</article>
+<p class="back"><a href="/">&larr; 返回首页</a></p>
+</main><script>
+${fieldRulesBrowserScript}
+const detailBox = document.getElementById('idea-detail');
+const titleEl = document.getElementById('d-title');
+const descEl = document.getElementById('d-desc');
+const scenarioRow = document.getElementById('d-scenario-row');
+const scenarioEl = document.getElementById('d-scenario');
+const timeEl = document.getElementById('d-time');
+const noteEl = document.getElementById('detail-note');
+const NOT_FOUND_TEXT = '该意见不存在。';
+const LOAD_FAILED_TEXT = '意见加载失败，请稍后刷新重试。';
+function showNote(message) {
+  noteEl.textContent = message;
+  noteEl.hidden = false;
+  detailBox.hidden = true;
+}
+function showIdea(idea) {
+  // 全部走 textContent：标题、说明与场景里的网页标记样文本、实体写法都按普通文字逐字显示，
+  // 不解析成页面元素，换行与空白由 pre 样式保留，长说明不截断。
+  titleEl.textContent = idea.title;
+  descEl.textContent = idea.description;
+  if (typeof idea.scenario === 'string' && idea.scenario.trim().length > 0) {
+    scenarioEl.textContent = idea.scenario;
+    scenarioRow.hidden = false;
+  } else {
+    scenarioRow.hidden = true;
+  }
+  timeEl.dateTime = idea.createdAt;
+  const parsed = new Date(idea.createdAt);
+  timeEl.textContent = isNaN(parsed.getTime()) ? String(idea.createdAt) : parsed.toLocaleString();
+  noteEl.hidden = true;
+  detailBox.hidden = false;
+}
+async function loadDetail() {
+  // 标识来自当前地址的路径段，原样拼到接口地址：浏览器会保留其百分号编码，
+  // 服务端按解码后的标识精确匹配，中文、空格与 / ? # 等特殊字符都能准确指向原记录。
+  // 不参考搜索关键词、表单草稿或任何首页状态。
+  const path = window.location.pathname;
+  let res;
+  try {
+    res = await fetch('/api' + path);
+  } catch {
+    showNote(LOAD_FAILED_TEXT);
+    return;
+  }
+  if (res.status === 404) {
+    // 明确是“这条意见不存在”：不能展示其他意见，也不能说成整个产品没有意见
+    showNote(NOT_FOUND_TEXT);
+    return;
+  }
+  let data = null;
+  try { data = await res.json(); } catch { data = null; }
+  if (!res.ok) {
+    // 存储无法读取、内容损坏、获取失败等：明确提示加载失败，不冒充不存在，也不展示半份详情
+    showNote(LOAD_FAILED_TEXT);
+    return;
+  }
+  // 与首页列表同一套结构判定（isCompleteIdea 由 idea-fields.ts 注入）：
+  // 结构不完整的响应不能展示半份详情；常规字段之外的内容不读取、不公开。
+  const idea = typeof data === 'object' && data !== null && !Array.isArray(data) ? data.idea : null;
+  if (!isCompleteIdea(idea)) {
+    showNote(LOAD_FAILED_TEXT);
+    return;
+  }
+  showIdea(idea);
+}
+loadDetail();
 </script></html>`;
 const args: string[] = process.argv.slice(2);
 const help: string = `FeatureHarbor - 产品意见与公开路线图
@@ -470,10 +573,52 @@ async function handleCreateIdea(req: IncomingMessage, res: ServerResponse): Prom
   }
   respond(res, 201, { idea });
 }
+// 按意见标识读取单条已保存意见（GET /api/ideas/<encoded-id>）。
+// 路径里的标识段是 encodeURIComponent 的结果：WHATWG URL 的 pathname 保留百分号编码，
+// 这里对“/api/ideas/”之后的整段原文解码一次，因此历史标识中的中文、空格以及
+// /、?、# 等在网址中有特殊含义的字符（编码后为 %2F、%3F、%23）都作为标识的一部分，
+// 不会被当成路径分隔符或查询；编码损坏无法解码时，按“不存在”处理。
+// 只按 id 精确匹配：标题与说明相同但 id 不同的两条意见互不干扰；不套用新提交限制。
+function handleGetIdea(res: ServerResponse, route: string): void {
+  const encodedId = route.slice('/api/ideas/'.length);
+  // 标识在地址中只占一个路径段：原始斜杠意味着多出的路径段，不是合法的查看链接。
+  // 标识本身含“/”时分享链接使用的是 %2F，因此这里拒绝原始斜杠不会误伤合法记录。
+  if (encodedId.length === 0 || encodedId.includes('/')) {
+    respond(res, 404, { error: 'not found' });
+    return;
+  }
+  let id: string;
+  try {
+    id = decodeURIComponent(encodedId);
+  } catch {
+    respond(res, 404, { error: 'not found' });
+    return;
+  }
+  let records: unknown[];
+  try {
+    records = readIdeas();
+  } catch {
+    // 已有数据无法读取或内容损坏：明确是加载失败，不能冒充“该意见不存在”
+    respond(res, 500, { error: 'unable to read ideas' });
+    return;
+  }
+  const found = records.find((record) => (record as Record<string, unknown>).id === id);
+  if (found === undefined) {
+    // 标识不存在：只返回 404，不能改返回其他意见，也不能说整个产品没有意见
+    respond(res, 404, { error: 'not found' });
+    return;
+  }
+  respond(res, 200, { idea: found });
+}
 const server = createServer((req: IncomingMessage, res: ServerResponse): void => {
   let route: string;
   try { route = new URL(req.url ?? '/', 'http://localhost').pathname; } catch { respond(res, 400, { error: 'invalid request path' }); return; }
-  if (!['/', '/health', '/api/ideas'].includes(route)) { respond(res, 404, { error: 'not found' }); return; }
+  // 单条意见接口：/api/ideas/<encoded-id>
+  if (route.startsWith('/api/ideas/')) {
+    if (req.method !== 'GET') { respond(res, 405, { error: 'method not allowed' }, { allow: 'GET' }); return; }
+    handleGetIdea(res, route);
+    return;
+  }
   if (route === '/api/ideas') {
     if (req.method === 'POST') {
       handleCreateIdea(req, res).catch(() => {
@@ -487,6 +632,18 @@ const server = createServer((req: IncomingMessage, res: ServerResponse): void =>
     } catch { respond(res, 500, { error: 'unable to read ideas' }); }
     return;
   }
+  // 单条意见查看页：/ideas/<encoded-id>。HTML 只是页面壳，记录由页面脚本按
+  // 地址栏标识请求上面的接口；直接打开或刷新分享链接都能看到同一条记录。
+  // 标识只占一个路径段（encodeURIComponent 不会产生原始斜杠）；
+  // 百分号编码本身是否对应真实记录由脚本请求接口后区分“不存在/加载失败”。
+  if (route.startsWith('/ideas/')) {
+    const encodedId = route.slice('/ideas/'.length);
+    if (encodedId.length === 0 || encodedId.includes('/')) { respond(res, 404, { error: 'not found' }); return; }
+    if (req.method !== 'GET') { respond(res, 405, { error: 'method not allowed' }, { allow: 'GET' }); return; }
+    respond(res, 200, DETAIL_PAGE, { html: true });
+    return;
+  }
+  if (!['/', '/health'].includes(route)) { respond(res, 404, { error: 'not found' }); return; }
   if (req.method !== 'GET') { respond(res, 405, { error: 'method not allowed' }); return; }
   if (route === '/') { respond(res, 200, PAGE, { html: true }); return; }
   respond(res, 200, { status: 'ok', product: PRODUCT });
