@@ -15,6 +15,9 @@ import {
 const PRODUCT: string = 'FeatureHarbor';
 const RESOURCE: string = 'ideas';
 const MAX_BODY_BYTES = 1_000_000;
+// 严格 UTF-8 解码器：遇非法字节直接抛错，而不是像 Buffer.toString('utf8') 那样把坏字节
+// 静默替换成“�”。decode 无状态、可对每份请求体复用。
+const utf8Decoder = new TextDecoder('utf-8', { fatal: true });
 // 接口侧把共用的内容判定结果映射成原有的错误说明；首页另有自己的措辞。
 const CONTENT_ERROR_MESSAGES: Record<ContentErrorCode, string> = {
   'title-empty': '标题去掉首尾空白后不能为空',
@@ -386,9 +389,22 @@ async function handleCreateIdea(req: IncomingMessage, res: ServerResponse): Prom
     respond(res, 400, { error: '请求体过大' });
     return;
   }
+  let text: string;
+  try {
+    // 先对完整重组后的正文做严格 UTF-8 解码：正文是作为一整份接收完才到这里，
+    // 因此合法多字节字符即使被拆到相邻 TCP 段/分块，重组后仍正常解码；
+    // 只有确实不符合 UTF-8 规则的字节（孤立续字节、残缺或非法多字节序列）才抛错。
+    // 绝不能用 toString('utf8')：它会把坏字节替换成“�”，替换后的文字若仍是合法 JSON
+    // 且字段通过校验就会误判成一次成功提交，而用户原文已被改写且没有任何提示。
+    // 用户原本输入、以合法 UTF-8 编码的“�”(U+FFFD) 在这里正常解出，按普通文字参与后续判定。
+    text = utf8Decoder.decode(Buffer.concat(chunks));
+  } catch {
+    respond(res, 400, { error: '请求体不是有效的 UTF-8' });
+    return;
+  }
   let payload: unknown;
   try {
-    payload = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    payload = JSON.parse(text);
   } catch {
     respond(res, 400, { error: '请求体不是有效的 JSON' });
     return;
