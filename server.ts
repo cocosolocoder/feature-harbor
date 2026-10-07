@@ -15,6 +15,10 @@ import {
 const PRODUCT: string = 'FeatureHarbor';
 const RESOURCE: string = 'ideas';
 const MAX_BODY_BYTES = 1_000_000;
+// 严格 UTF-8 解码器：fatal 模式遇到非法字节直接抛错，而不是像 Buffer.toString('utf8')
+// 那样把坏字节静默替换成“�”。整份正文先在完整的字节缓冲上通过它，才允许进入 JSON
+// 解析；分段送达在缓冲拼接后判断，合法多字节字符被拆到相邻段不算损坏。
+const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true });
 // 接口侧把共用的内容判定结果映射成原有的错误说明；首页另有自己的措辞。
 const CONTENT_ERROR_MESSAGES: Record<ContentErrorCode, string> = {
   'title-empty': '标题去掉首尾空白后不能为空',
@@ -379,16 +383,28 @@ async function handleCreateIdea(req: IncomingMessage, res: ServerResponse): Prom
     return;
   }
   // 无论是否预先声明长度（Content-Length）还是分段传输（Transfer-Encoding: chunked）、
-  // 超出发生在中途还是末段，都按同一条规则拒绝；即使正文同时不是合法 JSON，
-  // 理由也仍是“请求体过大”，不能被后续的 JSON 解析替换成别的错误。
+  // 超出发生在中途还是末段，都按同一条规则拒绝；即使正文同时不是合法 UTF-8 或合法 JSON，
+  // 理由也仍是“请求体过大”，不能被后续的 UTF-8/JSON 解析替换成别的错误。
   // 恰好达到上限（size === MAX_BODY_BYTES）不在这里拒绝，继续按 JSON 与字段规则判断。
   if (tooLarge) {
     respond(res, 400, { error: '请求体过大' });
     return;
   }
+  // 先按 UTF-8 严格解码整份正文，再解析 JSON：非法字节（单独的续字节、缺少后续
+  // 字节的多字节字符、不符合 UTF-8 规则的编码）无论在标题、说明、场景还是正文其他
+  // 位置，都让整次提交失败，不能把坏字节替换成“�”、删字节或只解析正常片段。
+  // 用户主动输入的“�”本身以合法 UTF-8（EF BF BD）编码，解码结果就是普通文字，照常进入后续判定。
+  const rawBody = Buffer.concat(chunks);
+  let bodyText: string;
+  try {
+    bodyText = UTF8_DECODER.decode(rawBody);
+  } catch {
+    respond(res, 400, { error: '请求体不是有效的 UTF-8' });
+    return;
+  }
   let payload: unknown;
   try {
-    payload = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    payload = JSON.parse(bodyText);
   } catch {
     respond(res, 400, { error: '请求体不是有效的 JSON' });
     return;
