@@ -39,6 +39,7 @@ button{margin-top:1rem;padding:.5rem 1.2rem;font:inherit}
 #success{color:#1a7f37;margin-top:.75rem}
 .idea{border-top:1px solid #ddd;padding:1rem 0}
 .idea h3{margin:0 0 .5rem}
+.view-link{display:inline-block;margin-top:.5rem}
 .pre{white-space:pre-wrap}
 time{color:#666;font-size:.9rem}
 #search-form{margin:1rem 0}
@@ -126,6 +127,15 @@ function renderIdea(idea) {
   const parsed = new Date(idea.createdAt);
   time.textContent = isNaN(parsed.getTime()) ? String(idea.createdAt) : parsed.toLocaleString();
   item.append(time);
+  // 每条已保存意见都有独立查看入口（搜索过滤后的结果与本页新提交同样带入口）：
+  // 链接只由该记录的标识 id 决定，与标题、说明文字无关；id 经 encodeURIComponent
+  // 编码，历史标识里的中文、空格或网址特殊字符也能准确指向自己的记录。
+  // 历史标题可能为空，但入口不依赖标题，空标题记录仍可打开。
+  const viewLink = document.createElement('a');
+  viewLink.className = 'view-link';
+  viewLink.href = '/ideas/' + encodeURIComponent(idea.id);
+  viewLink.textContent = '查看这条意见';
+  item.append(viewLink);
   return item;
 }
 let remoteIdeas = [];
@@ -288,6 +298,88 @@ searchClear.addEventListener('click', () => {
 });
 loadIdeas();
 </script></html>`;
+const VIEW_PATH_PREFIX = '/ideas/';
+// 单条意见查看页只展示常规字段（标题、完整详细说明、非空白使用场景、提交时间），
+// 记录携带的附加信息一律不在页面公开。与首页一样，历史内容不重新套用新提交的限制：
+// 超限、空白标题/说明、换行、中文、表情、网页标记样文本与实体写法都按原文显示。
+const VIEW_FIELD_LABELS = {
+  scenario: '使用场景',
+  createdAt: '提交时间',
+} as const;
+// 服务端渲染时把所有意见文字按普通文字转义进 HTML：尖括号、引号、& 逐字显示，
+// 不解析成页面元素；实体写法（如 &lt;）转义后显示为 &amp;lt;，仍是普通文字而不会被解码。
+function escapeHtml(text: string): string {
+  return text
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+type CompleteIdea = {
+  id: string;
+  title: string;
+  description: string;
+  scenario: string;
+  createdAt: string;
+};
+function renderIdeaViewPage(idea: CompleteIdea): string {
+  const scenarioBlock = idea.scenario.trim().length > 0
+    ? `<p><strong>${VIEW_FIELD_LABELS.scenario}：</strong><span class="pre">${escapeHtml(idea.scenario)}</span></p>\n`
+    : '';
+  return `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>意见详情 · FeatureHarbor</title><style>
+body{font-family:system-ui,sans-serif;max-width:52rem;margin:3rem auto;padding:0 1rem;line-height:1.7}
+a{color:#175b9c}
+.pre{white-space:pre-wrap}
+time{color:#666;font-size:.9rem}
+.back{display:inline-block;margin-bottom:1.5rem}
+.idea-id{color:#666;font-size:.9rem;word-break:break-all}
+</style><main><p><a class="back" href="/">&larr; 返回首页</a></p>
+<article class="idea">
+<h2>${escapeHtml(idea.title)}</h2>
+<p class="pre">${escapeHtml(idea.description)}</p>
+${scenarioBlock}<p><strong>${VIEW_FIELD_LABELS.createdAt}：</strong><time datetime="${escapeHtml(idea.createdAt)}">${escapeHtml(idea.createdAt)}</time></p>
+<p class="idea-id">意见标识：${escapeHtml(idea.id)}</p>
+</article>
+</main></html>`;
+}
+function renderMessagePage(heading: string, message: string): string {
+  return `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${heading} · FeatureHarbor</title><style>
+body{font-family:system-ui,sans-serif;max-width:52rem;margin:3rem auto;padding:0 1rem;line-height:1.7}
+a{color:#175b9c}
+.back{display:inline-block;margin-bottom:1.5rem}
+</style><main><p><a class="back" href="/">&larr; 返回首页</a></p>
+<h2>${heading}</h2>
+<p>${message}</p>
+</main></html>`;
+}
+// GET /ideas/:id —— 只展示该条已保存意见的独立页面，链接可直接分享、刷新后仍是同一条。
+// 以记录标识精确匹配（先 decodeURIComponent 还原路径段，中文、空格与特殊字符与原 id 逐字比较），
+// 标题与说明相同但 id 不同的记录各自打开各自的页面。存储读取失败明确提示加载失败（500），
+// 不能冒充不存在；能读取但找不到该 id 才提示该意见不存在（404），不展示其他意见。
+function handleIdeaView(res: ServerResponse, rawPath: string): void {
+  let targetId: string;
+  try {
+    targetId = decodeURIComponent(rawPath.slice(VIEW_PATH_PREFIX.length));
+  } catch {
+    respond(res, 404, renderMessagePage('该意见不存在', '你查看的意见不存在，可能已被删除。'), { html: true });
+    return;
+  }
+  let records: unknown[];
+  try {
+    records = readIdeas();
+  } catch {
+    respond(res, 500, renderMessagePage('意见加载失败', '意见数据暂时无法读取，请稍后刷新重试。'), { html: true });
+    return;
+  }
+  // readIdeas 已保证每条记录结构完整，这里只按标识逐字精确匹配
+  const match = records.find((record) => (record as CompleteIdea).id === targetId) as CompleteIdea | undefined;
+  if (!match) {
+    respond(res, 404, renderMessagePage('该意见不存在', '你查看的意见不存在，可能已被删除。'), { html: true });
+    return;
+  }
+  respond(res, 200, renderIdeaViewPage(match), { html: true });
+}
 const args: string[] = process.argv.slice(2);
 const help: string = `FeatureHarbor - 产品意见与公开路线图
 Usage: node server.ts serve [--host ADDRESS] [--port PORT] [--data-dir DIRECTORY]
@@ -473,7 +565,11 @@ async function handleCreateIdea(req: IncomingMessage, res: ServerResponse): Prom
 const server = createServer((req: IncomingMessage, res: ServerResponse): void => {
   let route: string;
   try { route = new URL(req.url ?? '/', 'http://localhost').pathname; } catch { respond(res, 400, { error: 'invalid request path' }); return; }
-  if (!['/', '/health', '/api/ideas'].includes(route)) { respond(res, 404, { error: 'not found' }); return; }
+  if (!['/', '/health', '/api/ideas'].includes(route) &&
+      !(route.startsWith(VIEW_PATH_PREFIX) && route.length > VIEW_PATH_PREFIX.length)) {
+    respond(res, 404, { error: 'not found' });
+    return;
+  }
   if (route === '/api/ideas') {
     if (req.method === 'POST') {
       handleCreateIdea(req, res).catch(() => {
@@ -485,6 +581,14 @@ const server = createServer((req: IncomingMessage, res: ServerResponse): void =>
     try {
       respond(res, 200, { [RESOURCE]: readIdeas() });
     } catch { respond(res, 500, { error: 'unable to read ideas' }); }
+    return;
+  }
+  // 单条意见查看页：路径段 /ideas/:id 由 URL 解析保证是 percent-encoded，
+  // handleIdeaView 内先 decodeURIComponent 再与存储的 id 逐字比较，
+  // 历史标识中的中文、空格与网址特殊字符经分享链接也能准确指向原记录。
+  if (route.startsWith(VIEW_PATH_PREFIX)) {
+    if (req.method !== 'GET') { respond(res, 405, { error: 'method not allowed' }, { allow: 'GET' }); return; }
+    handleIdeaView(res, route);
     return;
   }
   if (req.method !== 'GET') { respond(res, 405, { error: 'method not allowed' }); return; }
