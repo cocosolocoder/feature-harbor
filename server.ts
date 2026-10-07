@@ -131,9 +131,17 @@ function renderIdea(idea) {
   // 链接只由该记录的标识 id 决定，与标题、说明文字无关；id 经 encodeURIComponent
   // 编码，历史标识里的中文、空格或网址特殊字符也能准确指向自己的记录。
   // 历史标题可能为空，但入口不依赖标题，空标题记录仍可打开。
+  //
+  // 编码段前的固定字面量“@”是点路径归一化护栏：历史标识可以是“.”或“..”，
+  // encodeURIComponent 不编码点，直接拼成 /ideas/. 、/ideas/.. 会被浏览器当成
+  // 当前目录或上一级目录（即使手工写成 %2F 之外的 %2E 段也一样会被归一化），
+  // 请求到不了查看页，打开的是首页或未知路径。末段以“@”开头后整段不再是
+  // 点序列（/ideas/@. 、/ideas/@..），归一化不再发生，复制、刷新、换人打开
+  // 都落到同一条记录。标识自带的“@”会被编码成 %40，不会与标记位混淆；
+  // 不带“@”的旧链接仍由服务端兼容，同一标识的新旧链接结果一致。
   const viewLink = document.createElement('a');
   viewLink.className = 'view-link';
-  viewLink.href = '/ideas/' + encodeURIComponent(idea.id);
+  viewLink.href = '/ideas/@' + encodeURIComponent(idea.id);
   viewLink.textContent = '查看这条意见';
   item.append(viewLink);
   return item;
@@ -299,6 +307,12 @@ searchClear.addEventListener('click', () => {
 loadIdeas();
 </script></html>`;
 const VIEW_PATH_PREFIX = '/ideas/';
+// 查看链接编码段前的固定标记位：首页把链接拼成 /ideas/@<encodeURIComponent(id)>。
+// 末段因此不以点开头，浏览器与 URL 解析都不会把它当作“.”/“..”目录段归一化；
+// 标识自带的“@”经 encodeURIComponent 变成 %40，标记位是链接里唯一可能出现的
+// 原始“@”，所以剥且只剥这一个字符不会误伤任何标识。没有标记位的旧链接
+// （/ideas/<encodeURIComponent(id)>）继续按原方式解析，旧链接仍然有效。
+const VIEW_ID_MARKER = '@';
 // 单条意见查看页只展示常规字段（标题、完整详细说明、非空白使用场景、提交时间），
 // 记录携带的附加信息一律不在页面公开。与首页一样，历史内容不重新套用新提交的限制：
 // 超限、空白标题/说明、换行、中文、表情、网页标记样文本与实体写法都按原文显示。
@@ -354,13 +368,25 @@ a{color:#175b9c}
 </main></html>`;
 }
 // GET /ideas/:id —— 只展示该条已保存意见的独立页面，链接可直接分享、刷新后仍是同一条。
-// 以记录标识精确匹配（先 decodeURIComponent 还原路径段，中文、空格与特殊字符与原 id 逐字比较），
-// 标题与说明相同但 id 不同的记录各自打开各自的页面。存储读取失败明确提示加载失败（500），
-// 不能冒充不存在；能读取但找不到该 id 才提示该意见不存在（404），不展示其他意见。
+// 以记录标识精确匹配（剥掉链接标记位后 decodeURIComponent 还原路径段，中文、空格与
+// 特殊字符与原 id 逐字比较），标题与说明相同但 id 不同的记录各自打开各自的页面。
+// 存储读取失败明确提示加载失败（500），不能冒充不存在；能读取但找不到该 id 才提示
+// 该意见不存在（404），不展示其他意见。
+//
+// 入参 rawPath 是请求行里的原始路径（只切掉查询串，未经 new URL 归一化）：
+// “.”/“..”点段只有在原始路径里才能存活，经 URL.pathname 会被 remove_dot_segments
+// 抹成 /ideas/ 或 /。新链接带标记位“@”（/ideas/@<编码段>），旧链接没有；
+// 两种链接解出同一标识时展示结果一致。
 function handleIdeaView(res: ServerResponse, rawPath: string): void {
+  const encodedSegment = rawPath.slice(VIEW_PATH_PREFIX.length);
+  // 标记位是编码段前唯一一个原始“@”：标识自身的“@”经 encodeURIComponent
+  // 一定写成 %40，旧链接又不含标记位，因此剥且只剥开头这一个字符。
+  const encodedId = encodedSegment.startsWith(VIEW_ID_MARKER)
+    ? encodedSegment.slice(VIEW_ID_MARKER.length)
+    : encodedSegment;
   let targetId: string;
   try {
-    targetId = decodeURIComponent(rawPath.slice(VIEW_PATH_PREFIX.length));
+    targetId = decodeURIComponent(encodedId);
   } catch {
     respond(res, 404, renderMessagePage('该意见不存在', '你查看的意见不存在，可能已被删除。'), { html: true });
     return;
@@ -563,10 +589,16 @@ async function handleCreateIdea(req: IncomingMessage, res: ServerResponse): Prom
   respond(res, 201, { idea });
 }
 const server = createServer((req: IncomingMessage, res: ServerResponse): void => {
-  let route: string;
-  try { route = new URL(req.url ?? '/', 'http://localhost').pathname; } catch { respond(res, 400, { error: 'invalid request path' }); return; }
-  if (!['/', '/health', '/api/ideas'].includes(route) &&
-      !(route.startsWith(VIEW_PATH_PREFIX) && route.length > VIEW_PATH_PREFIX.length)) {
+  // 路由依据请求行里的原始目标：只切掉查询串，不做 percent-decode，也不经过
+  // new URL —— 后者的 pathname 会按 RFC 3986 的 remove_dot_segments 把“.”/“..”
+  // 段（连 %2E 形态也一样）归一成当前/上级目录，标识为“.”或“..”的查看链接
+  // 会在到达这里之前就变成 /ideas/ 或 /，永远无法命中对应记录。
+  // 原始路径里的点段配合链接标记位“@”才能准确定位这两条历史记录。
+  const requestTarget = req.url ?? '/';
+  const queryIndex = requestTarget.indexOf('?');
+  const route: string = queryIndex === -1 ? requestTarget : requestTarget.slice(0, queryIndex);
+  const isViewRoute = route.startsWith(VIEW_PATH_PREFIX) && route.length > VIEW_PATH_PREFIX.length;
+  if (!['/', '/health', '/api/ideas'].includes(route) && !isViewRoute) {
     respond(res, 404, { error: 'not found' });
     return;
   }
@@ -583,10 +615,10 @@ const server = createServer((req: IncomingMessage, res: ServerResponse): void =>
     } catch { respond(res, 500, { error: 'unable to read ideas' }); }
     return;
   }
-  // 单条意见查看页：路径段 /ideas/:id 由 URL 解析保证是 percent-encoded，
-  // handleIdeaView 内先 decodeURIComponent 再与存储的 id 逐字比较，
-  // 历史标识中的中文、空格与网址特殊字符经分享链接也能准确指向原记录。
-  if (route.startsWith(VIEW_PATH_PREFIX)) {
+  // 单条意见查看页：route 是请求行中的原始路径段 /ideas/:id（未经 URL 归一化），
+  // handleIdeaView 先剥标记位“@”再 decodeURIComponent，与存储的 id 逐字比较：
+  // 点段标识、中文、空格与网址特殊字符经分享链接都能准确指向原记录。
+  if (route.startsWith(VIEW_PATH_PREFIX) && isViewRoute) {
     if (req.method !== 'GET') { respond(res, 405, { error: 'method not allowed' }, { allow: 'GET' }); return; }
     handleIdeaView(res, route);
     return;

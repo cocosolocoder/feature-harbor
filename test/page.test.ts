@@ -280,10 +280,11 @@ function assertArticleMatches(article: El, idea: Record<string, unknown>): void 
   }
   const time = article.children.find((n) => n.tagName === 'TIME')!;
   assert.equal(time.dateTime, idea.createdAt);
-  // 每条意见都有独立查看入口：href 只由 id 经 encodeURIComponent 拼成，可直接分享
+  // 每条意见都有独立查看入口：href 由标记位“@”加 encodeURIComponent(id) 拼成，
+  // 可直接分享；“@”保证标识为“.”/“..”时链接不被浏览器路径归一化吞掉
   const viewLink = findViewLink(article);
   assert.ok(viewLink, '每条意见都应有查看入口');
-  assert.equal(viewLink!.href, `/ideas/${encodeURIComponent(String(idea.id))}`);
+  assert.equal(viewLink!.href, `/ideas/@${encodeURIComponent(String(idea.id))}`);
   assert.equal(viewLink!.textContent, '查看这条意见');
 }
 
@@ -2612,11 +2613,13 @@ test('结构判定不为接受超限旧内容而放宽：结构完整的超限�
 });
 
 // 独立查看入口回归（首页内联脚本侧）：每条已保存意见都在列表与搜索结果中带查看链接，
-// 链接只由该记录的 id 决定，特殊 id 经 encodeURIComponent 编码，空标题记录同样可打开。
+// 链接只由该记录的 id 决定，特殊 id 经 encodeURIComponent 编码并带“@”标记位，
+// “.”/“..”标识也不会被路径归一化，空标题记录同样可打开。
 test('查看入口：首次加载的每条意见都带独立链接，按 id 区分，特殊字符 id 正确编码', async () => {
   const specialId = '中文 id 含空格/和?特殊&字符 #';
   const ideas = [
-    makeIdea({ id: 'r1', title: '普通意见', description: '说明' }),
+    makeIdea({ id: '.', title: '点标识意见', description: '说明' }),
+    makeIdea({ id: '..', title: '双点标识意见', description: '说明' }),
     makeIdea({ id: specialId, title: '特殊标识意见', description: '说明' }),
     makeIdea({ id: 'r3', title: '', description: '空标题的历史意见' }),
     makeIdea({ id: 'dup-a', title: '同文', description: '同样的说明' }),
@@ -2627,15 +2630,19 @@ test('查看入口：首次加载的每条意见都带独立链接，按 id 区�
   await flush();
 
   const articles = h.articles();
-  assert.equal(articles.length, 5);
+  assert.equal(articles.length, 6);
   ideas.forEach((idea, index) => assertArticleMatches(articles[index], idea));
   // 同文不同 id：各自入口指向各自记录
   const links = articles.map((a) => findViewLink(a)!.href);
-  assert.deepEqual(links, ideas.map((idea) => `/ideas/${encodeURIComponent(idea.id)}`));
-  assert.notEqual(links[3], links[4]);
-  assert.equal(links[1], `/ideas/${encodeURIComponent(specialId)}`);
-  // 链接里不能出现未编码的空格或 / ? & # 等网址特殊字符（斜杠编码成 %2F）
-  assert.ok(!/[\s/?&#]/.test(links[1].slice('/ideas/'.length)));
+  assert.deepEqual(links, ideas.map((idea) => `/ideas/@${encodeURIComponent(idea.id)}`));
+  assert.notEqual(links[4], links[5]);
+  // 点段标识的链接在“@”护栏之后逐字保留，未被编码成别的样子，也没有丢标识段
+  assert.equal(links[0], '/ideas/@.');
+  assert.equal(links[1], '/ideas/@..');
+  assert.equal(links[2], `/ideas/@${encodeURIComponent(specialId)}`);
+  // 链接里不能出现未编码的空格或 / ? & # 等网址特殊字符（斜杠编码成 %2F）；
+  // 斜杠检查只针对编码段，跳过标记位“@”本身
+  assert.ok(!/[\s/?&#]/.test(links[2].slice('/ideas/@'.length)));
 });
 
 test('查看入口：搜索结果中的每条意见同样带入口且仍按 id 指向各自记录', async () => {
@@ -2651,14 +2658,14 @@ test('查看入口：搜索结果中的每条意见同样带入口且仍按 id �
   h.search('深色');
   let visible = h.articles();
   assert.equal(visible.length, 2);
-  assert.equal(findViewLink(visible[0])!.href, '/ideas/r1');
-  assert.equal(findViewLink(visible[1])!.href, '/ideas/r2');
+  assert.equal(findViewLink(visible[0])!.href, '/ideas/@r1');
+  assert.equal(findViewLink(visible[1])!.href, '/ideas/@r2');
 
   // 清空搜索后所有记录（含刚才不可见的一条）的入口都在
   h.clearSearch();
   visible = h.articles();
   assert.equal(visible.length, 3);
-  ideas.forEach((idea, index) => assert.equal(findViewLink(visible[index])!.href, `/ideas/${encodeURIComponent(idea.id)}`));
+  ideas.forEach((idea, index) => assert.equal(findViewLink(visible[index])!.href, `/ideas/@${encodeURIComponent(idea.id)}`));
 });
 
 test('查看入口：空标题或纯空白标题的历史记录仍有可操作入口，不因标题缺失无法打开', async () => {
@@ -2673,9 +2680,9 @@ test('查看入口：空标题或纯空白标题的历史记录仍有可操作�
 
   const articles = h.articles();
   assert.equal(articles.length, 3);
-  assert.equal(findViewLink(articles[0])!.href, '/ideas/empty-1');
-  assert.equal(findViewLink(articles[1])!.href, '/ideas/ws-1');
-  assert.equal(findViewLink(articles[2])!.href, '/ideas/ok-1');
+  assert.equal(findViewLink(articles[0])!.href, '/ideas/@empty-1');
+  assert.equal(findViewLink(articles[1])!.href, '/ideas/@ws-1');
+  assert.equal(findViewLink(articles[2])!.href, '/ideas/@ok-1');
   // 入口文字不依赖标题
   for (const article of articles) {
     assert.equal(findViewLink(article)!.textContent, '查看这条意见');
@@ -2697,5 +2704,5 @@ test('查看入口：本页新提交确认的意见同样带入口，入口以�
   const articles = h.articles();
   assert.equal(articles.length, 1);
   assertArticleMatches(articles[0], mine);
-  assert.equal(findViewLink(articles[0])!.href, '/ideas/just-saved-1');
+  assert.equal(findViewLink(articles[0])!.href, '/ideas/@just-saved-1');
 });

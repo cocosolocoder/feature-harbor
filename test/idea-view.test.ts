@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { connect, type Socket } from 'node:net';
 import { join } from 'node:path';
 import { startServer, removeDataDir, type StartedServer } from '../testing/server.ts';
 
@@ -11,7 +12,9 @@ import { startServer, removeDataDir, type StartedServer } from '../testing/serve
 //     内容只来自磁盘上该 id 的已保存内容，不依赖首页、搜索或表单草稿；
 //   - 查看页展示标题、完整详细说明（长内容不截断）、非空白使用场景与提交时间，
 //     并提供返回首页入口；标题/说明相同但 id 不同的记录各自打开各自的页面；
-//   - 历史标识可能含中文、空格或网址特殊字符，链接经 encodeURIComponent 后仍准确指向原记录；
+//   - 历史标识可能含中文、空格、“.”/“..”或网址特殊字符：首页链接带“@”标记位
+//     （/ideas/@<encodeURIComponent(id)>），点段不被浏览器路径归一化吞掉，
+//     编码后经分享链接仍准确指向原记录；修复前的旧链接形态继续可用，新旧链接一致；
 //   - 历史内容兼容：超限、空白标题/说明、换行、中文、表情、网页标记样文本与实体写法按原文展示，
 //     标记不解析成页面元素；常规字段之外的附加信息不在查看页公开；
 //   - 链接指向不存在的 id：明确提示该意见不存在（404）并可返回首页，不展示其他意见；
@@ -41,12 +44,58 @@ async function startWith(dir: string): Promise<StartedServer> {
   return startServer(dir);
 }
 
+// 打开首页实际生成的可分享链接：/ideas/@<encodeURIComponent(id)>。
+// “@”标记位让末段不以点开头，标识为“.”/“..”（连手工 %2E 形态）时
+// 浏览器也不会按当前/上级目录归一化，复制、刷新或换人打开都落到同一条记录。
 async function fetchView(server: StartedServer, id: string, init?: RequestInit): Promise<Response> {
+  return fetch(`${server.origin}/ideas/@${encodeURIComponent(id)}`, init);
+}
+
+// 修复前已公开的旧链接形态：/ideas/<encodeURIComponent(id)>，必须继续可用
+async function fetchViewOldForm(server: StartedServer, id: string, init?: RequestInit): Promise<Response> {
   return fetch(`${server.origin}/ideas/${encodeURIComponent(id)}`, init);
 }
 
 async function fetchViewRaw(server: StartedServer, rawIdSegment: string, init?: RequestInit): Promise<Response> {
   return fetch(`${server.origin}/ideas/${rawIdSegment}`, init);
+}
+
+// 直接按给定请求行发原始 GET：fetch/curl 这类客户端会在发送前归一点段，
+// 只有裸请求行才能验证服务端路由自身保留了“.”/“..”原始路径信息。
+function rawGet(server: StartedServer, path: string): Promise<{ status: number; text: string; headers: Record<string, string> }> {
+  const port = Number(new URL(server.origin).port);
+  return new Promise((resolve, reject) => {
+    const sock: Socket = connect(port, '127.0.0.1');
+    let received = Buffer.alloc(0);
+    let settled = false;
+    const fail = (error: Error): void => {
+      if (settled) return;
+      settled = true;
+      sock.destroy();
+      reject(error);
+    };
+    sock.on('error', (error) => fail(error));
+    sock.on('data', (chunk) => { received = Buffer.concat([received, chunk]); });
+    sock.on('end', () => {
+      if (settled) return;
+      const split = received.indexOf('\r\n\r\n');
+      if (split === -1) { fail(new Error('响应不完整')); return; }
+      const headerText = received.subarray(0, split).toString('latin1');
+      const text = received.subarray(split + 4).toString('utf8');
+      const lines = headerText.split('\r\n');
+      const status = Number((lines[0].match(/HTTP\/1\.1 (\d+)/) ?? [])[1]);
+      const headers: Record<string, string> = {};
+      for (const line of lines.slice(1)) {
+        const at = line.indexOf(':');
+        if (at > 0) headers[line.slice(0, at).trim().toLowerCase()] = line.slice(at + 1).trim();
+      }
+      settled = true;
+      resolve({ status, text, headers });
+    });
+    sock.on('connect', () => {
+      sock.write(`GET ${path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n`);
+    });
+  });
 }
 
 // 与 server.ts 一致的 HTML 转义：服务端把意见文字转义后嵌进页面，
@@ -215,6 +264,191 @@ test('历史标识含中文、空格与网址特殊字符：编码后的分享�
     assert.equal(literalSlash.status, 200);
     const literalSlashHtml = await literalSlash.text();
     assert.ok(literalSlashHtml.includes('意见标识：slash/inside'));
+  } finally {
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('历史标识为“.”或“..”：首页链接可分享，直接打开、刷新或换人访问仍是同一条记录', async () => {
+  const ideas: Idea[] = [
+    { id: '.', title: '标识是一个点', description: '一个点标识的完整说明', scenario: '点的使用场景', createdAt: '2023-01-01T00:00:00.000Z' },
+    { id: '..', title: '标识是两个点', description: '两个点标识的完整说明', scenario: '', createdAt: '2023-02-02T00:00:00.000Z' },
+    { id: 'normal', title: '普通标识的意见', description: '普通标识的说明', scenario: '', createdAt: '2023-03-03T00:00:00.000Z' },
+  ];
+  const dir = freshDir();
+  seedIdeas(dir, ideas);
+  const server = await startWith(dir);
+  try {
+    for (const idea of ideas) {
+      // 首页实际生成的链接形态
+      const href = `/ideas/@${encodeURIComponent(idea.id)}`;
+      assert.equal(href, idea.id === 'normal' ? '/ideas/@normal' : `/ideas/@${idea.id}`);
+      const res = await fetchView(server, idea.id);
+      assert.equal(res.status, 200, `id=${JSON.stringify(idea.id)} 的新链接应 200`);
+      assert.match(res.headers.get('content-type') ?? '', /text\/html/);
+      const html = await res.text();
+      assert.ok(html.includes(`意见标识：${escapeHtml(idea.id)}`), `id=${JSON.stringify(idea.id)}`);
+      assert.ok(html.includes(escapeHtml(idea.title)), `id=${JSON.stringify(idea.id)}`);
+      assert.ok(html.includes(escapeHtml(idea.description)), `id=${JSON.stringify(idea.id)}`);
+      // 分享后直接打开与刷新逐字一致
+      const again = await fetchView(server, idea.id);
+      assert.equal(again.status, 200);
+      assert.equal(await again.text(), html);
+      assertBackHome(html);
+    }
+
+    // “.”与“..”两条互相独立：各自页面都不出现另一条的内容
+    const dotHtml = await (await fetchView(server, '.')).text();
+    const dotDotHtml = await (await fetchView(server, '..')).text();
+    assert.ok(dotHtml.includes('意见标识：.'));
+    assert.ok(!dotHtml.includes('意见标识：..'));
+    assert.ok(!dotHtml.includes('两个点标识的完整说明'));
+    assert.ok(dotDotHtml.includes('意见标识：..'));
+    assert.ok(!dotDotHtml.includes('标识是一个点'));
+
+    // 首页真实渲染出的入口 href 必须就是新形态（点标识带 @ 护栏）
+    const homeHtml = await (await fetch(`${server.origin}/`)).text();
+    assert.ok(homeHtml.includes("viewLink.href = '/ideas/@' + encodeURIComponent(idea.id)"));
+  } finally {
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('点段标识的分享链接不被 URL 路径归一化：编码形态与裸请求行都能准确定位', async () => {
+  const dir = freshDir();
+  seedIdeas(dir, [
+    { id: '.', title: '点 DOT', description: '点正文', scenario: '', createdAt: '2023-01-01T00:00:00.000Z' },
+    { id: '..', title: '双点 DOTDOT', description: '双点正文', scenario: '', createdAt: '2023-02-02T00:00:00.000Z' },
+  ]);
+  const server = await startWith(dir);
+  try {
+    // fetch 与浏览器同样基于 WHATWG URL：即使手工把点编码成 %2E，发送前也会被
+    // 归一化掉；加了“@”护栏后，%2E 不再是点段，链接原样送达并准确定位。
+    for (const path of ['/ideas/@%2E', '/ideas/@%2e', '/ideas/@%2E%2E', '/ideas/@%2e%2e', '/ideas/@.', '/ideas/@..']) {
+      const res = await fetch(`${server.origin}${path}`);
+      assert.equal(res.status, 200, path);
+      const html = await res.text();
+      const wants = path.endsWith('..') || path.toLowerCase().endsWith('%2e%2e') ? '..' : '.';
+      assert.ok(html.includes(`意见标识：${wants}`), `${path} 应定位 ${wants}`);
+    }
+
+    // 裸请求行验证服务端自身：路由依据原始请求行，未经 new URL 归一化，
+    // 因此直接发来的 /ideas/. 与 /ideas/..（旧形态、无 @ 护栏）也能解出对应记录。
+    for (const [rawPath, wantId, wantTitle] of [
+      ['/ideas/.', '.', '点 DOT'],
+      ['/ideas/..', '..', '双点 DOTDOT'],
+      ['/ideas/%2E', '.', '点 DOT'],
+      ['/ideas/%2e%2e', '..', '双点 DOTDOT'],
+      ['/ideas/@.', '.', '点 DOT'],
+      ['/ideas/@..', '..', '双点 DOTDOT'],
+    ] as const) {
+      const r = await rawGet(server, rawPath);
+      assert.equal(r.status, 200, rawPath);
+      assert.ok(r.text.includes(`意见标识：${wantId}`), rawPath);
+      assert.ok(r.text.includes(wantTitle), rawPath);
+    }
+  } finally {
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('标识为文字“%2E”/“%2E%2E”与标识为“.”/“..”是不同意见，链接各自独立不混淆', async () => {
+  const ideas: Idea[] = [
+    { id: '.', title: '标题-点', description: '正文-点', scenario: '', createdAt: '2023-01-01T00:00:00.000Z' },
+    { id: '..', title: '标题-双点', description: '正文-双点', scenario: '', createdAt: '2023-02-02T00:00:00.000Z' },
+    { id: '%2E', title: '标题-文字%2E', description: '正文-文字%2E', scenario: '', createdAt: '2023-03-03T00:00:00.000Z' },
+    { id: '%2E%2E', title: '标题-文字%2E%2E', description: '正文-文字%2E%2E', scenario: '', createdAt: '2023-04-04T00:00:00.000Z' },
+  ];
+  const dir = freshDir();
+  seedIdeas(dir, ideas);
+  const server = await startWith(dir);
+  try {
+    // 首页链接：文字“%2E”经编码变成 %252E，与点的护栏链接 /ideas/@%2E 完全不同
+    assert.equal(encodeURIComponent('%2E'), '%252E');
+    assert.equal(encodeURIComponent('%2E%2E'), '%252E%252E');
+    for (const idea of ideas) {
+      const res = await fetchView(server, idea.id);
+      assert.equal(res.status, 200, `id=${JSON.stringify(idea.id)}`);
+      const html = await res.text();
+      assert.ok(html.includes(escapeHtml(idea.title)), `id=${JSON.stringify(idea.id)}`);
+      // 页面上有且只有一个标识段，且与当前 id 逐字相等——
+      // 点、双点、文字 %2E、文字 %2E%2E 四种标识互不顶替
+      const shown = [...html.matchAll(/意见标识：([^<]+)/g)].map((m) => m[1]);
+      assert.deepEqual(shown, [idea.id], `id=${JSON.stringify(idea.id)}`);
+    }
+    // 直接打文字“%2E”的编码链接 /ideas/@%252E，不会被解成点
+    const literal = await fetch(`${server.origin}/ideas/@%252E`);
+    assert.equal(literal.status, 200);
+    const literalHtml = await literal.text();
+    assert.deepEqual([...literalHtml.matchAll(/意见标识：([^<]+)/g)].map((m) => m[1]), ['%2E']);
+    assert.ok(!literalHtml.includes('标题-点'));
+  } finally {
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('新旧两种链接形态指向同一标识时展示逐字一致；标识自带“@”也不受标记位影响', async () => {
+  const ideas: Idea[] = [
+    { id: '@', title: '标识是一个 at', description: 'at 正文', scenario: '', createdAt: '2023-01-05T00:00:00.000Z' },
+    { id: '@start', title: 'at 开头的标识', description: '正文', scenario: '', createdAt: '2023-01-06T00:00:00.000Z' },
+    { id: 'a@b', title: '中间带 at', description: '正文', scenario: '', createdAt: '2023-01-07T00:00:00.000Z' },
+    { id: 'legacy-x', title: '普通历史意见', description: '正文', scenario: '', createdAt: '2023-01-08T00:00:00.000Z' },
+  ];
+  const dir = freshDir();
+  seedIdeas(dir, ideas);
+  const server = await startWith(dir);
+  try {
+    for (const idea of ideas) {
+      // 新形态（@护栏 + 全编码，自带 @ 变成 %40）与旧形态解出同一标识
+      const newRes = await fetchView(server, idea.id);
+      const oldRes = await fetchViewOldForm(server, idea.id);
+      assert.equal(newRes.status, 200, idea.id);
+      assert.equal(oldRes.status, 200, idea.id);
+      const newHtml = await newRes.text();
+      const oldHtml = await oldRes.text();
+      assert.equal(oldHtml, newHtml, `id=${idea.id} 新旧链接应一致`);
+      assert.ok(newHtml.includes(`意见标识：${escapeHtml(idea.id)}`), idea.id);
+    }
+    // 新链接里标识自带的 @ 一定被编码，标记位是唯一原始 @
+    const atHref = `/ideas/@${encodeURIComponent('@start')}`;
+    assert.equal(atHref, '/ideas/@%40start');
+    const r = await fetch(`${server.origin}${atHref}`);
+    assert.equal(r.status, 200);
+    assert.ok((await r.text()).includes('意见标识：@start'));
+  } finally {
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('点段标识不存在时：新链接与裸请求行都返回 404 提示页，不落到首页或其他意见', async () => {
+  const dir = freshDir();
+  seedIdeas(dir, [
+    { id: 'real', title: '唯一真实意见标题 QQQ', description: '唯一真实正文', scenario: '', createdAt: '2023-01-01T00:00:00.000Z' },
+  ]);
+  const server = await startWith(dir);
+  try {
+    // 存储里没有 “.” 与 “..”：新链接必须是 HTML 404，不能被归一化成首页（200）或 JSON 404
+    for (const path of ['/ideas/@.', '/ideas/@..', '/ideas/@%2E', '/ideas/@%2e%2e']) {
+      const res = await fetch(`${server.origin}${path}`);
+      assert.equal(res.status, 404, path);
+      assert.match(res.headers.get('content-type') ?? '', /text\/html/, path);
+      const html = await res.text();
+      assert.ok(html.includes('该意见不存在'), path);
+      assert.ok(!html.includes('唯一真实意见标题 QQQ'), path);
+      assertBackHome(html);
+    }
+    // 裸请求行同样 404 HTML（点段在服务端被保留并参与匹配，匹配不上即不存在）
+    for (const rawPath of ['/ideas/.', '/ideas/..']) {
+      const r = await rawGet(server, rawPath);
+      assert.equal(r.status, 404, rawPath);
+      assert.match(r.headers['content-type'] ?? '', /text\/html/, rawPath);
+      assert.ok(r.text.includes('该意见不存在'), rawPath);
+    }
   } finally {
     await server.stop();
     rmSync(dir, { recursive: true, force: true });
@@ -473,8 +707,9 @@ test('查看相关路由：畸形百分号编码按不存在处理；/ideas/ 与
   ]);
   const server = await startWith(dir);
   try {
-    // decodeURIComponent 会抛错的路径段：不能导致 500，按找不到该意见处理
-    for (const segment of ['%zz', '%E4%B8%AD', '%']) {
+    // decodeURIComponent 会抛错的路径段：不能导致 500，按找不到该意见处理；
+    // 新旧两种链接形态都一样（标记位只负责剥掉开头一个“@”）
+    for (const segment of ['%zz', '%E4%B8%AD', '%', '@%zz', '@%E4%B8%AD', '@%']) {
       const res = await fetchViewRaw(server, segment);
       assert.equal(res.status, 404, segment);
       const html = await res.text();
