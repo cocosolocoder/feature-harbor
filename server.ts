@@ -16,8 +16,8 @@ const PRODUCT: string = 'FeatureHarbor';
 const RESOURCE: string = 'ideas';
 const MAX_BODY_BYTES = 1_000_000;
 // 严格 UTF-8 解码器：fatal 模式遇到非法字节直接抛错，而不是像 Buffer.toString('utf8')
-// 那样把坏字节静默替换成“�”。整份正文先在完整的字节缓冲上通过它，才允许进入 JSON
-// 解析；分段送达在缓冲拼接后判断，合法多字节字符被拆到相邻段不算损坏。
+// 那样把坏字节静默替换成“�”。请求正文与磁盘上的已有意见都先在完整的字节缓冲上通过它，
+// 才允许进入 JSON 解析；分段送达在缓冲拼接后判断，合法多字节字符被拆到相邻段不算损坏。
 const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true });
 // 接口侧把共用的内容判定结果映射成原有的错误说明；首页另有自己的措辞。
 const CONTENT_ERROR_MESSAGES: Record<ContentErrorCode, string> = {
@@ -329,7 +329,22 @@ function respond(res: ServerResponse, status: number, value: unknown, options: {
 // 已有意见的结构完整性直接使用 idea-fields.ts 的 isCompleteIdea，
 // 与首页列表加载、提交结果确认共用同一份判定。
 function readIdeas(): unknown[] {
-  const records: unknown = JSON.parse(readFileSync(dataFile, 'utf8'));
+  // 先拿到原始字节并用 fatal TextDecoder 严格解码，再交给 JSON.parse：
+  // readFileSync(path, 'utf8') 内部走 Buffer.toString('utf8')，会把非法 UTF-8 字节
+  // 静默替换成“�”。替换后的文字若仍能组成完整记录，列表就会正常返回；此后提交新意见
+  // 还会把替换后的旧内容一并保存，原始字节就此被改写。因此这里绝不能按“文字里有没有
+  // �”判断（用户主动写下的“�”是以合法 UTF-8 EF BF BD 编码的普通文字，必须照常读取），
+  // 而要由保存内容的实际字节编码决定：单独的续字节、缺少后续字节的多字节字符、不符合
+  // UTF-8 规则的编码，无论出现在标题、详细说明、使用场景还是其他位置，都让整份数据
+  // 读取失败——不替换、不忽略、不只读取其中的正常片段。
+  const raw = readFileSync(dataFile);
+  let text: string;
+  try {
+    text = UTF8_DECODER.decode(raw);
+  } catch {
+    throw new Error('Invalid UTF-8 in ideas storage');
+  }
+  const records: unknown = JSON.parse(text);
   if (!Array.isArray(records)) throw new Error('Invalid record list');
   // 任意一条记录不完整，整份列表都视为读取失败：
   // 不跳过异常记录，也不只返回正常部分。只检查结构，不套用新提交的内容限制：
